@@ -20,7 +20,7 @@ public class learning01 : MonoBehaviour
         public int HitPoints;
         public int ActionPoints;
 
-        public void TakeDamage(int dmg) { HitPoints = HitPoints = Mathf.Max(0, HitPoints - dmg); }
+        public void TakeDamage(int dmg) { HitPoints = Mathf.Max(0, HitPoints - dmg); }
     }
     void Start()
     {
