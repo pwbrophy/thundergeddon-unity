@@ -1,5 +1,9 @@
 using UnityEngine;
 
+
+
+
+[DefaultExecutionOrder(-1000)]  // runs very early
 public class AppBootstrap : MonoBehaviour
 {
     [SerializeField] private bool startInMainMenu = true;
@@ -21,5 +25,8 @@ public class AppBootstrap : MonoBehaviour
         // Optional: force a starting phase
         if (startInMainMenu)
             flow.BackToMenu();
+
+        // Optional debug
+        Debug.Log("[AppBootstrap] GameFlow created");
     }
 }

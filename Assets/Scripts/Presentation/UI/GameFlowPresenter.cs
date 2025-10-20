@@ -22,10 +22,10 @@ public class GameFlowPresenter : MonoBehaviour
         _flow = ServiceLocator.GameFlow;
 
         // Hook UI buttons
-        if (toLobbyButton) toLobbyButton.onClick.AddListener(() => _flow.GoToLobby());
-        if (startGameButton) startGameButton.onClick.AddListener(() => _flow.StartGame());
+        if (toLobbyButton)    toLobbyButton.onClick.AddListener(() => _flow.GoToLobby());
+        if (startGameButton)  startGameButton.onClick.AddListener(() => _flow.StartGame());
         if (backToMenuButton) backToMenuButton.onClick.AddListener(() => _flow.BackToMenu());
-        if (endGameButton) endGameButton.onClick.AddListener(() => _flow.EndGame());
+        if (endGameButton)    endGameButton.onClick.AddListener(() => _flow.EndGame());
 
         // React to phase changes
         _flow.OnPhaseChanged += HandlePhaseChanged;
@@ -39,19 +39,19 @@ public class GameFlowPresenter : MonoBehaviour
         if (_flow != null) _flow.OnPhaseChanged -= HandlePhaseChanged;
 
         // Unhook buttons (optional for now)
-        if (toLobbyButton) toLobbyButton.onClick.RemoveAllListeners();
-        if (startGameButton) startGameButton.onClick.RemoveAllListeners();
+        if (toLobbyButton)    toLobbyButton.onClick.RemoveAllListeners();
+        if (startGameButton)  startGameButton.onClick.RemoveAllListeners();
         if (backToMenuButton) backToMenuButton.onClick.RemoveAllListeners();
-        if (endGameButton) endGameButton.onClick.RemoveAllListeners();
+        if (endGameButton)    endGameButton.onClick.RemoveAllListeners();
     }
 
     void HandlePhaseChanged(GamePhase p)
     {
         // Show exactly one panel; hide the others
         if (mainMenuPanel) mainMenuPanel.SetActive(p == GamePhase.MainMenu);
-        if (lobbyPanel) lobbyPanel.SetActive(p == GamePhase.Lobby);
-        if (playingPanel) playingPanel.SetActive(p == GamePhase.Playing);
-        if (endedPanel) endedPanel.SetActive(p == GamePhase.Ended);
+        if (lobbyPanel)    lobbyPanel.SetActive(p == GamePhase.Lobby);
+        if (playingPanel)  playingPanel.SetActive(p == GamePhase.Playing);
+        if (endedPanel)    endedPanel.SetActive(p == GamePhase.Ended);
 
         // Enable/disable critical buttons safely
         if (startGameButton) startGameButton.interactable = _flow.CanStartGame();
