@@ -26,14 +26,22 @@ public sealed class GameFlow
         OnPhaseChanged?.Invoke(Phase);
     }
 
-    public bool CanGoToLobby() => Phase == GamePhase.MainMenu;
+    public bool CanGoToLobby()
+    {
+        return Phase == GamePhase.MainMenu;
+    }
+
     public void GoToLobby()
     {
         if (!CanGoToLobby()) return;
         SetPhase(GamePhase.Lobby);
     }
 
-    public bool CanStartGame() => Phase == GamePhase.Lobby && _game.CanStart();
+    public bool CanStartGame()
+    { 
+        return Phase == GamePhase.Lobby && _game.CanStart();
+    }
+
     public void StartGame()
     {
         if (!CanStartGame()) return;
@@ -41,7 +49,11 @@ public sealed class GameFlow
         SetPhase(GamePhase.Playing);
     }
 
-    public bool CanEndGame() => Phase == GamePhase.Playing;
+    public bool CanEndGame()
+    { 
+        return Phase == GamePhase.Playing; 
+    }
+
     public void EndGame()
     {
         if (!CanEndGame()) return;
