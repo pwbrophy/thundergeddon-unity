@@ -19,6 +19,8 @@ public class GameFlowPresenter : MonoBehaviour
 
     void OnEnable()
     {
+        Debug.Log("We're in the GameGlowPresenter OnEnable now");
+
         _flow = ServiceLocator.GameFlow;
 
         // Hook UI buttons
@@ -36,6 +38,8 @@ public class GameFlowPresenter : MonoBehaviour
 
     void OnDisable()
     {
+
+        Debug.Log("We're in the GameGlowPresenter OnDisable now");
         if (_flow != null) _flow.OnPhaseChanged -= HandlePhaseChanged;
 
         // Unhook buttons (optional for now)
@@ -47,6 +51,8 @@ public class GameFlowPresenter : MonoBehaviour
 
     void HandlePhaseChanged(GamePhase p)
     {
+
+        Debug.Log("We're in the GameGlowPresenter HandlePhaseChange now");
         // Show exactly one panel; hide the others
         if (mainMenuPanel) mainMenuPanel.SetActive(p == GamePhase.MainMenu);
         if (lobbyPanel)    lobbyPanel.SetActive(p == GamePhase.Lobby);
