@@ -6,5 +6,5 @@ public class RobotInfo
     public string Callsign;        // nice display name (editable)
     public string Ip;              // last-known local IP
     public string AssignedPlayer;  // "Player1" or "Player2" for now
-    public bool IsOnline;        // true when recently seen/connected
+
 }

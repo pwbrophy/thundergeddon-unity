@@ -176,8 +176,7 @@ public class RobotsPanelPresenter : MonoBehaviour
         TextMeshProUGUI playerText = rowGO.transform.Find("Player").GetComponent<TextMeshProUGUI>();
         Button editButton = rowGO.transform.Find("EditButton").GetComponent<Button>();
 
-        string status = r.IsOnline ? "Online" : "Offline";
-        nameText.text = $"{r.Callsign}  ({status})";
+        nameText.text = r.Callsign;
         ipText.text = string.IsNullOrEmpty(r.Ip) ? "IP: ?" : $"IP: {r.Ip}";
         playerText.text = string.IsNullOrEmpty(r.AssignedPlayer) ? "Unassigned" : r.AssignedPlayer;
 

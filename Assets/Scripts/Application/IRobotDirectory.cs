@@ -1,24 +1,32 @@
 using System;
 using System.Collections.Generic;
 
-// The contract the UI talks to.
-// "Events" are doorbells the UI can subscribe to, so the list auto-updates.
+// The registry the UI talks to.
+// We keep only robots that are "present".
+// When a robot disappears, call Remove(robotId).
 public interface IRobotDirectory
 {
     IReadOnlyList<RobotInfo> GetAll();
 
-    // Events (UI listens to these)
+    // Events that presenters listen to for live updates
     event Action<RobotInfo> OnRobotAdded;
     event Action<RobotInfo> OnRobotUpdated;
-    event Action<string> OnRobotRemoved;  // by RobotId
+    event Action<string> OnRobotRemoved; // robotId
 
-    // Mutating methods (UI calls these)
-    void UpsertOnline(string robotId, string callsign, string ip);
-    void SetOnline(string robotId, bool online);
+    // Add or update a robot that is present.
+    // If it's new -> added; if it exists -> updated fields (name/ip/player).
+    void Upsert(string robotId, string callsign, string ip);
+
+    // Change editable fields
     void SetCallsign(string robotId, string newCallsign);
     void SetAssignedPlayer(string robotId, string playerName);
+
+    // Robot is gone (disconnected or timed out) -> remove from registry
     bool Remove(string robotId);
 
-    // Helper: try get current info
+    // Remove the most recently added robot (by insertion order)
+    bool RemoveLast();
+
+    // Helper to query
     bool TryGet(string robotId, out RobotInfo info);
 }
