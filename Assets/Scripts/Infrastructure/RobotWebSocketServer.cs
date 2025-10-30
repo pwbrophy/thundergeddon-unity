@@ -27,6 +27,9 @@ public class RobotWebSocketServer : MonoBehaviour
     private IRobotDirectory _dir;               // Your robot registry (set in AppBootstrap)
     private GameFlow _flow;                     // Your game flow (to enforce "Lobby only")
 
+    [Header("Logging")]
+    public bool VerboseHeartbeats = true;
+
     // --- Session tracking (very small, very simple) ---
     private class SessionInfo                    // Holds data about one websocket session
     {
@@ -56,26 +59,18 @@ public class RobotWebSocketServer : MonoBehaviour
         }
 
         // Build "ws://<ip>:<port>" just like your working WebSocketServerHost
-        var ip = PetersUtils.GetLocalIPAddress().ToString();
-        var addr = "ws://" + ip + ":" + Port;
+        var ip = PetersUtils.GetLocalIPAddress().ToString();   // Get your local LAN IP (your helper method)
+        var addr = "ws://" + ip + ":" + Port;                  // Compose the server address string
+        Debug.Log("[WS] Starting server at " + addr + Path);   // Log where we will listen
 
-        // EITHER bind to a specific IP (your current style)…
-        //_wss = new WebSocketServer(addr);
-
-        // …OR (recommended for testing) bind to all interfaces:
-         _wss = new WebSocketServer(System.Net.IPAddress.Any, Port);
-
-        // ---- Add these two lines (verbose logs) ----
-        _wss.Log.Level = WebSocketSharp.LogLevel.Trace;
-        _wss.Log.Output = (d, msg) => Debug.Log($"[WSS {d.Level}] {msg}");
-        // -------------------------------------------
-
-        _wss.KeepClean = false; // you can KEEP this line
-
-        _wss.AddWebSocketService<ESP32Service>(Path, svc => svc.Parent = this);
-        _wss.Start();
-
-        Debug.Log("[WS] Started on " + (addr + Path));
+        _wss = new WebSocketServer(addr);                      // Create the WebSocketServer bound to that address
+        _wss.KeepClean = false;                                // Disable aggressive cleanup (helps during dev)
+        _wss.AddWebSocketService<ESP32Service>(                // Register one service at the given Path
+            Path,                                              // The URL path (e.g., /esp32)
+            svc => { svc.Parent = this; }                      // For each connection, give the behavior a back-reference
+        );
+        _wss.Start();                                          // Start listening for connections
+        Debug.Log("[WS] Started");                              // Log confirmation
 
         _nextSweepTime = Time.time + SweepIntervalSeconds;     // Schedule the first timeout sweep
     }
@@ -183,7 +178,12 @@ public class RobotWebSocketServer : MonoBehaviour
         if (!string.IsNullOrEmpty(robotId))                     // If we actually had a robot id
         {
             _sessionByRobot.Remove(robotId);                    // Remove reverse mapping robot->session
+            Debug.Log($"[WS] Disconnect: robotId={robotId} sid={sid} code={e.Code} reason={e.Reason}");
             _dir.Remove(robotId);                               // Remove from RobotDirectory so it disappears from UI
+        }
+        else
+        {
+            Debug.Log($"[WS] Disconnect (no hello yet): sid={sid} code={e.Code} reason={e.Reason}");
         }
     }
 
@@ -223,6 +223,11 @@ public class RobotWebSocketServer : MonoBehaviour
             if (_bySession.TryGetValue(sid, out var s))         // Find the session info
             {
                 s.LastSeenTime = Time.time;                     // Update last seen time to now
+                if (VerboseHeartbeats)
+                {
+                    var rid = string.IsNullOrEmpty(s.RobotId) ? "(unknown)" : s.RobotId;
+                    Debug.Log($"[WS] Heartbeat: robotId={rid} sid={sid}");
+                }
             }
             return;                                             // Done with heartbeat
         }
@@ -230,7 +235,6 @@ public class RobotWebSocketServer : MonoBehaviour
         // Other commands can be added here later (rename, control, etc.)
     }
 
-    // Close one WebSocket session by its session ID
     private void CloseSession(string sid)
     {
         var host = Host();                 // Get the service host for our path
@@ -244,7 +248,6 @@ public class RobotWebSocketServer : MonoBehaviour
             // Ignore errors in this simple prototype
         }
     }
-
 
     // --- Timeout sweep removes dead sessions/robots ---
     private void SweepTimeouts()                                // Called every SweepIntervalSeconds from Update
@@ -267,27 +270,35 @@ public class RobotWebSocketServer : MonoBehaviour
 
         if (toClose.Count == 0) return;                         // Nothing to do
 
-        var host = Host();                                      // Get the WebSocket service host
-        for (int i = 0; i < toClose.Count; i++)                 // Loop each stale session
+        var host = Host();
+        for (int i = 0; i < toClose.Count; i++)
         {
-            string sid = toClose[i];                            // One session id
-            string rid = null;                                  // Robot id (if any)
-            if (_bySession.TryGetValue(sid, out var s))         // Look up info
+            string sid = toClose[i];
+            string rid = null;
+            float lastSeen = 0f;
+
+            if (_bySession.TryGetValue(sid, out var s))
             {
-                rid = s.RobotId;                                // Grab robot id
-                _bySession.Remove(sid);                         // Remove the session
+                rid = s.RobotId;
+                lastSeen = s.LastSeenTime;
+                _bySession.Remove(sid);
             }
 
-            if (!string.IsNullOrEmpty(rid))                     // If we had a robot id
+            if (!string.IsNullOrEmpty(rid))
             {
-                _sessionByRobot.Remove(rid);                    // Remove reverse map
-                _dir.Remove(rid);                               // Remove from directory (UI list updates)
+                _sessionByRobot.Remove(rid);
+                float age = Time.time - lastSeen;
+                Debug.LogWarning($"[WS] Missed heartbeat: robotId={rid} sid={sid} age={age:0.00}s > {TimeoutSeconds:0.00}s → removing");
+                _dir.Remove(rid);
+            }
+            else
+            {
+                Debug.LogWarning($"[WS] Missed heartbeat: sid={sid} (no robotId) → closing");
             }
 
-            if (host != null)                                   // If the host exists
+            if (host != null)
             {
-                try { host.Sessions.CloseSession(sid); }        // Ask server to close the stale session
-                catch { /* ignore */ }                          // Ignore errors during close
+                try { host.Sessions.CloseSession(sid); } catch { }
             }
         }
     }

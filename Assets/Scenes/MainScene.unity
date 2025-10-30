@@ -1304,7 +1304,7 @@ RectTransform:
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
   m_AnchorMin: {x: 0, y: 0}
   m_AnchorMax: {x: 1, y: 1}
-  m_AnchoredPosition: {x: -21, y: -503}
+  m_AnchoredPosition: {x: 0, y: -644}
   m_SizeDelta: {x: -304.318, y: -1709.71}
   m_Pivot: {x: 0.5, y: 0.5}
 --- !u!114 &157727707
@@ -4596,7 +4596,7 @@ MonoBehaviour:
   m_linkedTextComponent: {fileID: 0}
   parentLinkedComponent: {fileID: 0}
   m_enableKerning: 1
-  m_ActiveFontFeatures: 00000000
+  m_ActiveFontFeatures: 6e72656b
   m_enableExtraPadding: 0
   checkPaddingRequired: 0
   m_isRichText: 1
@@ -5960,7 +5960,7 @@ MonoBehaviour:
   m_linkedTextComponent: {fileID: 0}
   parentLinkedComponent: {fileID: 0}
   m_enableKerning: 1
-  m_ActiveFontFeatures: 00000000
+  m_ActiveFontFeatures: 6e72656b
   m_enableExtraPadding: 0
   checkPaddingRequired: 0
   m_isRichText: 1
@@ -8972,7 +8972,19 @@ MonoBehaviour:
   m_TargetGraphic: {fileID: 1273295852}
   m_OnClick:
     m_PersistentCalls:
-      m_Calls: []
+      m_Calls:
+      - m_Target: {fileID: 1836209634}
+        m_TargetAssemblyTypeName: ModeController, Assembly-CSharp
+        m_MethodName: EnterServerMode
+        m_Mode: 1
+        m_Arguments:
+          m_ObjectArgument: {fileID: 0}
+          m_ObjectArgumentAssemblyTypeName: UnityEngine.Object, UnityEngine
+          m_IntArgument: 0
+          m_FloatArgument: 0
+          m_StringArgument: 
+          m_BoolArgument: 0
+        m_CallState: 2
 --- !u!114 &1273295852
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -9460,7 +9472,19 @@ MonoBehaviour:
   m_TargetGraphic: {fileID: 1300821209}
   m_OnClick:
     m_PersistentCalls:
-      m_Calls: []
+      m_Calls:
+      - m_Target: {fileID: 1836209634}
+        m_TargetAssemblyTypeName: ModeController, Assembly-CSharp
+        m_MethodName: EnterClientMode
+        m_Mode: 1
+        m_Arguments:
+          m_ObjectArgument: {fileID: 0}
+          m_ObjectArgumentAssemblyTypeName: UnityEngine.Object, UnityEngine
+          m_IntArgument: 0
+          m_FloatArgument: 0
+          m_StringArgument: 
+          m_BoolArgument: 0
+        m_CallState: 2
 --- !u!114 &1300821209
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -12429,6 +12453,7 @@ GameObject:
   - component: {fileID: 1836209630}
   - component: {fileID: 1836209632}
   - component: {fileID: 1836209633}
+  - component: {fileID: 1836209634}
   m_Layer: 0
   m_Name: App
   m_TagString: Untagged
@@ -12471,7 +12496,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1836209629}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 6d9777666c7da2142836505d42744c7e, type: 3}
   m_Name: 
@@ -12486,7 +12511,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1836209629}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: aa62b5d44f2cfa84f8e9d4ed29f004c5, type: 3}
   m_Name: 
@@ -12495,6 +12520,20 @@ MonoBehaviour:
   Path: /esp32
   TimeoutSeconds: 6
   SweepIntervalSeconds: 1
+--- !u!114 &1836209634
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1836209629}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 7e4fe323e4a744c4d89531797a57c2aa, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::ModeController
+  WebSocketServer: {fileID: 1836209633}
+  UdpListener: {fileID: 1836209632}
 --- !u!1 &1842293330
 GameObject:
   m_ObjectHideFlags: 0
@@ -13692,7 +13731,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!224 &2007372665
 RectTransform:
   m_ObjectHideFlags: 0
@@ -14418,7 +14457,7 @@ MonoBehaviour:
   m_linkedTextComponent: {fileID: 0}
   parentLinkedComponent: {fileID: 0}
   m_enableKerning: 1
-  m_ActiveFontFeatures: 00000000
+  m_ActiveFontFeatures: 6e72656b
   m_enableExtraPadding: 0
   checkPaddingRequired: 0
   m_isRichText: 1
