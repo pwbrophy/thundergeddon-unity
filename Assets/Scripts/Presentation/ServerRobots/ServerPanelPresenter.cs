@@ -30,11 +30,12 @@ public class ServerPanelPresenter : MonoBehaviour
 
     private void OnDisable()
     {
-
+        if (_dir != null && _isSubscribed)
+        {
             _dir.OnRobotAdded -= HandleRobotAdded;
             _dir.OnRobotRemoved -= HandleRobotRemoved;
             _isSubscribed = false;
-
+        }
     }
 
     private void HandleRobotAdded(RobotInfo r)

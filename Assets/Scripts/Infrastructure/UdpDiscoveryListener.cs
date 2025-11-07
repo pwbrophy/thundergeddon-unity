@@ -34,7 +34,7 @@ public class UdpDiscoveryListener : MonoBehaviour
     private readonly object _mtx = new object();              // Lock for the queue
     private readonly Queue<Action> _main = new Queue<Action>(); // Actions to run on Unity's main thread
 
-    private void OnEnable()                                   // Called when this component is enabled
+    public void StartUDPServer()                           // Called when this component is enabled
     {
         _dir = ServiceLocator.RobotDirectory;               // Get robot directory from your service locator
         _flow = ServiceLocator.GameFlow;                     // Get game flow to know current phase
@@ -178,12 +178,13 @@ public class UdpDiscoveryListener : MonoBehaviour
 
                     // 2) Reply to THIS sender with our WebSocket URL.
                     //    Use the UDP socket's *local* address to avoid sending a wrong NIC/VPN IP.
-                    IPEndPoint localEp = (IPEndPoint)_udp.Client.LocalEndPoint;  // Our local bind (IP:port)
-                    string wsUrl = "ws://" + localEp.Address + ":" + websocketPort + websocketPath; // Build URL text
+                    string ip = PetersUtils.GetLocalIPAddress().ToString(); // or your own util to pick an IPv4 on the active NIC
+                    string wsUrl = "ws://" + ip + ":" + websocketPort + websocketPath;
                     string reply = "{\"ws\":\"" + wsUrl + "\"}"; // Minimal JSON reply the robot expects
                     byte[] outBytes = Encoding.UTF8.GetBytes(reply); // Turn reply into bytes
 
                     _udp.Send(outBytes, outBytes.Length, remote);   // Send reply back to the sender (unicast)
+                    Debug.Log("[UDP] Replied to " + robotId + " at " + senderIp + " with " + wsUrl); // Log the reply
                 }
             }
             catch (SocketException)                          // Thrown when socket is closed while blocked in Receive
