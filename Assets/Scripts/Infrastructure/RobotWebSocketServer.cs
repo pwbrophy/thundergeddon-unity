@@ -4,6 +4,7 @@ using System.Collections.Generic;               // Dictionary, List, Queue
 using UnityEngine;                              // MonoBehaviour, Debug, Time
 using WebSocketSharp;                           // MessageEventArgs, CloseEventArgs
 using WebSocketSharp.Server;                    // WebSocketServer, WebSocketBehavior
+using System.Globalization;
 
 public class RobotWebSocketServer : MonoBehaviour
 {
@@ -352,6 +353,42 @@ public class RobotWebSocketServer : MonoBehaviour
     public bool SendStreamOff(string robotId)
     {
         return SendJsonToRobot(robotId, "{\"cmd\":\"stream_off\"}");
+    }
+
+    public bool SendStreamOn(string robotId)                    // Tell a robot to start its camera
+    {
+        return SendJsonToRobot(robotId, "{\"cmd\":\"stream_on\"}"); // Use same generic sender
+    }
+
+    public bool SendMotorsOn(string robotId)
+    {
+        bool ok = SendJsonToRobot(robotId, "{\"cmd\":\"motors_on\"}");
+        Debug.Log(ok ? $"[WS->Robot] motors_on → {robotId}" : $"[WS->Robot] FAILED motors_on → {robotId}");
+        return ok;
+    }
+    public bool SendMotorsOff(string robotId)
+    {
+        bool ok = SendJsonToRobot(robotId, "{\"cmd\":\"motors_off\"}");
+        Debug.Log(ok ? $"[WS->Robot] motors_off → {robotId}" : $"[WS->Robot] FAILED motors_off → {robotId}");
+        return ok;
+    }
+
+    public bool SendDrive(string robotId, float left, float right)
+    {
+        // Ensure decimals use '.' regardless of OS locale
+        string l = left.ToString("F3", CultureInfo.InvariantCulture);
+        string r = right.ToString("F3", CultureInfo.InvariantCulture);
+        string json = $"{{\"cmd\":\"drive\",\"l\":{l},\"r\":{r}}}";
+        Debug.Log($"[WS->Robot] drive l={l} r={r} → {robotId}");
+        return SendJsonToRobot(robotId, json);
+    }
+
+    public bool SendTurret(string robotId, float speed)
+    {
+        string s = speed.ToString("F3", CultureInfo.InvariantCulture);
+        string json = $"{{\"cmd\":\"turret\",\"speed\":{s}}}";
+        Debug.Log($"[WS->Robot] turret {s} → {robotId}");
+        return SendJsonToRobot(robotId, json);
     }
 
     // ===== Internals =====

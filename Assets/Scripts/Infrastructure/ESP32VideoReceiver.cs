@@ -42,6 +42,17 @@ public sealed class ESP32VideoReceiver : MonoBehaviour
         }
     }
 
+    public void ClearActiveRobot()                          // Deselect and blank the display
+    {
+        _activeRobotId = null;                              // No active robot
+        if (target != null && _tex != null)                 // If UI is wired
+        {
+            _tex.Reinitialize(2, 2);                        // Reset to tiny texture (appears blank)
+            _tex.Apply(false, false);                       // Apply
+            target.texture = _tex;                          // Keep bound
+        }
+    }
+
     public void SetTarget(RawImage ri)          // Optional: assign target from code instead of Inspector
     {
         target = ri;                             // Store the UI control
