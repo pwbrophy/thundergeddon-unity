@@ -1,0 +1,918 @@
+using System.Collections.Generic;                 // For List<T>
+using TMPro;                                      // For TextMeshProUGUI
+using UnityEngine;                                // For MonoBehaviour, Debug
+using UnityEngine.UI;                             // For Button
+
+/// <summary>
+/// GamePanelPresenter
+/// - Wires the Playing screen to TurnManager.
+/// - Shows "Alliance N • PlayerName".
+/// - Filters RobotSelectionPanel to only the current player's robots.
+/// - End Turn steps player?player?next alliance.
+/// </summary>
+public class GamePanelPresenter : MonoBehaviour
+{
+    [Header("UI")]                                                   // Inspector wiring
+    [SerializeField] private TextMeshProUGUI turnLabel;              // "Alliance N • PlayerName"
+    [SerializeField] private Button endTurnButton;                   // Ends current player's turn
+    [SerializeField] private RobotSelectionPanel selectionPanel;     // Filters by allowed robots
+
+    // References to shared services.
+    private IRobotDirectory _dir;                                    // Robot directory
+    private TurnManager _turns;                                      // Turn controller
+
+    private void OnEnable()
+    {
+        // Resolve services.
+        _dir = ServiceLocator.RobotDirectory;                        // Directory
+        if (_dir == null) { Debug.LogError("[GamePanel] RobotDirectory missing"); return; } // Safety
+
+        // Create the turn manager.
+        _turns = new TurnManager();                                  // New manager
+
+        // IMPORTANT: Subscribe BEFORE Initialize(), so we catch the initial PublishTurn().
+        _turns.TurnChanged += OnTurnChanged;                         // Listen first
+
+        // Now initialize (this will call PublishTurn() and we will receive it).
+        _turns.Initialize(_dir);                                     // Wire + build + publish
+
+        // Wire the end-turn button to advance the turn.
+        if (endTurnButton) endTurnButton.onClick.AddListener(OnEndTurnClicked); // Hook
+    }
+
+    private void OnDisable()
+    {
+        // Unwire events to avoid leaks.
+        if (_turns != null) _turns.TurnChanged -= OnTurnChanged;     // Unhook
+        if (endTurnButton) endTurnButton.onClick.RemoveListener(OnEndTurnClicked); // Unhook
+    }
+
+    // Update UI when the current turn changes.
+    private void OnTurnChanged(int allianceIndex, int playerIndexInAlliance, List<string> allowedIds)
+    {
+        // Compute a friendly label: "Alliance N • PlayerName" (or "—" if no players in that alliance).
+        string playerName = _turns.CurrentPlayerName ?? "—";         // Name or dash
+        if (turnLabel) turnLabel.text = $"Alliance {allianceIndex + 1} • {playerName}"; // Label
+
+        // Apply the allowed filter to the selection panel.
+        if (selectionPanel) selectionPanel.SetAllowedFilter(allowedIds); // Filter list
+
+        // Ensure the current selection is valid for this turn.
+        // - If selected robot is NOT in allowed list, we auto-deselect (and stop cam/motors).
+        // - Then we auto-select the first allowed robot (if any) to keep things snappy.
+        if (selectionPanel) selectionPanel.EnsureValidSelectionAfterFilter(autoSelectFirstAllowed: true); // Fix selection
+    }
+
+    // Button: advance to next player (and alliance when appropriate).
+    private void OnEndTurnClicked()
+    {
+        // Ask TurnManager to step the turn (player?player?next alliance).
+        _turns?.EndTurn();                                           // Advance
+    }
+}
+using System;                                     // For Action
+using System.Collections.Generic;                 // For List
+using TMPro;                                      // For TMP_Dropdown, TMP_InputField
+using UnityEngine;                                // For MonoBehaviour, GameObject, Mathf
+using UnityEngine.UI;                             // For Button
+
+// PlayersEditorPanel — minimal UI to manage players + their alliances.
+// IMPORTANT: We suppress UI callbacks while we programmatically update controls to avoid recursion.
+public class PlayersEditorPanel : MonoBehaviour
+{
+    [Header("Root Visibility")]                            // Group to toggle panel
+    [SerializeField] private GameObject root;               // Root container of this panel
+
+    [Header("Controls")]                                    // UI references (assign in Inspector)
+    [SerializeField] private TMP_Dropdown playersDropdown;  // Combo box of players
+    [SerializeField] private Button addButton;              // Add player
+    [SerializeField] private Button removeButton;           // Remove selected player
+    [SerializeField] private TMP_InputField nameField;      // Live-edit player name
+    [SerializeField] private TMP_Dropdown allianceDropdown; // Combo box of alliances (numeric for now)
+
+    // Service that stores the players list.
+    private PlayersService _players;
+
+    // Currently selected player index in the service list.
+    private int _currentIndex = -1;
+
+    // Flag to suppress event handlers while we update UI programmatically.
+    private bool _updating = false;
+
+    // Unity: called when this panel is enabled.
+    private void OnEnable()
+    {
+        // If no explicit root was assigned in the inspector, use this GameObject as the root container.
+        if (!root) root = this.gameObject;                                  // Fallback for root
+
+        // Acquire the shared PlayersService (normally created in AppBootstrap).
+        _players = ServiceLocator.Players;                                  // Cache global instance
+
+        // Safety net: if the service is still missing, create it and register it once.
+        if (_players == null)                                              // Did nothing create it yet?
+        {
+            Debug.LogWarning("[PlayersEditorPanel] ServiceLocator.Players was null; creating a new PlayersService."); // Warn
+            _players = new PlayersService();                                // Allocate fresh service
+            _players.EnsureDefaults();                                      // Seed with Player1 / Player2
+            ServiceLocator.Players = _players;                              // Register globally for everyone else
+        }
+
+        // Make sure there is at least a basic set of players for the UI to edit.
+        _players.EnsureDefaults();                                         // No-op if already populated
+
+        // Subscribe to service change events so the UI updates when players change.
+        _players.OnChanged -= HandlePlayersChanged;                         // Avoid double-subscribe
+        _players.OnChanged += HandlePlayersChanged;                         // React to changes in players list
+
+        // Wire up UI event handlers.
+        if (addButton) addButton.onClick.AddListener(OnAddPlayerClicked);                 // Add player
+        if (removeButton) removeButton.onClick.AddListener(OnRemovePlayerClicked);           // Remove player
+        if (playersDropdown) playersDropdown.onValueChanged.AddListener(OnPlayerDropdownChanged); // Change selection
+        if (nameField) nameField.onValueChanged.AddListener(OnNameEditedLive);            // Live rename
+        if (allianceDropdown) allianceDropdown.onValueChanged.AddListener(OnAllianceChanged);   // Change alliance
+
+        // Build initial UI once (suppress callbacks while we fill controls).
+        _updating = true;                                                  // Begin suppression
+        RebuildAllUI();                                                    // Fill dropdowns + text fields
+        _updating = false;                                                 // End suppression
+    }
+
+
+    // Unity: called when this panel is disabled.
+    private void OnDisable()
+    {
+        // Unsubscribe from service events to avoid leaks.
+        if (_players != null) _players.OnChanged -= HandlePlayersChanged;                // Unhook
+
+        // Unwire UI events.
+        if (addButton) addButton.onClick.RemoveListener(OnAddPlayerClicked);         // Unhook
+        if (removeButton) removeButton.onClick.RemoveListener(OnRemovePlayerClicked);   // Unhook
+        if (playersDropdown) playersDropdown.onValueChanged.RemoveListener(OnPlayerDropdownChanged); // Unhook
+        if (nameField) nameField.onValueChanged.RemoveListener(OnNameEditedLive);    // Unhook
+        if (allianceDropdown) allianceDropdown.onValueChanged.RemoveListener(OnAllianceChanged);     // Unhook
+    }
+
+    // Handle any change from PlayersService (add/remove/rename/set-alliance).
+    private void HandlePlayersChanged()
+    {
+        // Suppress callbacks while we rebuild UI in response to model changes.
+        _updating = true;                                           // Begin suppression
+        RebuildPlayersDropdown();                                   // Refresh players list
+        RebuildAllianceDropdown();                                  // Refresh alliance list
+        RefreshFieldsFromSelection();                               // Sync text + alliance value
+        _updating = false;                                          // End suppression
+    }
+
+    // Add a new player and select it.
+    private void OnAddPlayerClicked()
+    {
+        // If we are already updating UI, ignore.
+        if (_updating) return;                                      // Guard
+
+        // Add with auto name and alliance 0 by default.
+        int idx = _players.AddPlayer();                             // Returns new index
+        _currentIndex = idx;                                        // Select new player
+
+        // Rebuild players list and select the new one in UI without firing callbacks.
+        _updating = true;                                           // Begin suppression
+        RebuildPlayersDropdown();                                   // Refresh names
+        if (playersDropdown && _currentIndex >= 0)
+            playersDropdown.SetValueWithoutNotify(_currentIndex);   // Select in dropdown (no notify)
+        RefreshFieldsFromSelection();                               // Update text + alliance
+        _updating = false;                                          // End suppression
+    }
+
+    // Remove the selected player.
+    private void OnRemovePlayerClicked()
+    {
+        // If we are already updating UI, ignore.
+        if (_updating) return;                                      // Guard
+        if (_currentIndex < 0) return;                              // Nothing selected
+
+        // Remove from service (it will fire OnChanged).
+        _players.RemovePlayerAt(_currentIndex);                     // Remove selection
+
+        // Choose a valid new selection.
+        var all = _players.GetAll();                                // Snapshot list
+        if (all.Count == 0) _currentIndex = -1;                     // Nothing remains
+        else _currentIndex = Mathf.Clamp(_currentIndex, 0, all.Count - 1); // Clamp index
+
+        // Reflect selection in UI without triggering events.
+        _updating = true;                                           // Begin suppression
+        RebuildPlayersDropdown();                                   // Refresh names
+        if (playersDropdown && _currentIndex >= 0)
+            playersDropdown.SetValueWithoutNotify(_currentIndex);   // Select (no notify)
+        RefreshFieldsFromSelection();                               // Update fields
+        _updating = false;                                          // End suppression
+    }
+
+    // Player dropdown changed — switch selected index.
+    private void OnPlayerDropdownChanged(int newIndex)
+    {
+        // Ignore if we are suppressing programmatic updates.
+        if (_updating) return;                                      // Guard
+
+        // Store the new selection.
+        _currentIndex = newIndex;                                   // Track selection
+
+        // Refresh the editable fields to match that player (without re-triggering).
+        _updating = true;                                           // Begin suppression
+        RefreshFieldsFromSelection();                               // Update text + alliance
+        _updating = false;                                          // End suppression
+    }
+
+    // Name edited live — rename player and keep the dropdown caption in sync.
+    private void OnNameEditedLive(string newText)
+    {
+        // Ignore if we are suppressing or nothing selected.
+        if (_updating) return;                                      // Guard
+        if (_currentIndex < 0) return;                              // No selection
+
+        // Rename in service (fires OnChanged ? we rebuild UI under suppression).
+        _players.RenamePlayer(_currentIndex, newText);              // Rename selected
+    }
+
+    // Alliance dropdown changed — assign to selected player.
+    private void OnAllianceChanged(int newAllianceIndex)
+    {
+        // Ignore if we are suppressing or nothing selected.
+        if (_updating) return;                                      // Guard
+        if (_currentIndex < 0) return;                              // No selection
+
+        // Apply via service (clamped against GameService.State.Alliances inside).
+        _players.SetPlayerAlliance(_currentIndex, newAllianceIndex); // Update selection
+        // OnChanged will fire and UI will rebuild under suppression.
+    }
+
+    // Build all UI elements from current state.
+    private void RebuildAllUI()
+    {
+        // Rebuild alliances first, then players, then fields (all under suppression by caller).
+        RebuildAllianceDropdown();                                  // Fill alliance numbers
+        RebuildPlayersDropdown();                                   // Fill player names
+
+        // Choose a sensible default selection.
+        var all = _players.GetAll();                                // Snapshot
+        if (all.Count == 0) _currentIndex = -1;                     // Nothing to select
+        else if (_currentIndex < 0) _currentIndex = 0;              // Pick first
+
+        // Apply selection to UI WITHOUT NOTIFY to avoid loops.
+        if (playersDropdown && _currentIndex >= 0)
+            playersDropdown.SetValueWithoutNotify(_currentIndex);   // Select without notify
+
+        // Refresh fields to reflect selection (use without-notify setters).
+        RefreshFieldsFromSelection();                               // Set name + alliance
+    }
+
+    // Rebuild the players dropdown from service list (no notify here).
+    private void RebuildPlayersDropdown()
+    {
+        // If control missing, nothing to do.
+        if (!playersDropdown) return;
+
+        // Snapshot players.
+        var list = _players.GetAll();                               // Copy of players
+
+        // Convert to TMP options using player names.
+        var options = new List<TMP_Dropdown.OptionData>();          // Build new options
+        for (int i = 0; i < list.Count; i++)                        // For each player
+            options.Add(new TMP_Dropdown.OptionData(list[i].Name)); // Add name as label
+
+        // Replace options and clamp selection (all under suppression by caller).
+        playersDropdown.ClearOptions();                             // Wipe old
+        playersDropdown.AddOptions(options);                        // Add new
+        if (list.Count == 0) _currentIndex = -1;                    // Nothing to select
+        else _currentIndex = Mathf.Clamp(_currentIndex, 0, list.Count - 1); // Clamp
+        if (_currentIndex >= 0) playersDropdown.SetValueWithoutNotify(_currentIndex); // Select (no notify)
+        playersDropdown.RefreshShownValue();                        // Refresh caption
+    }
+
+    // Rebuild the alliance dropdown using GameService.State.Alliances (no notify here).
+    private void RebuildAllianceDropdown()
+    {
+        // If control missing, nothing to do.
+        if (!allianceDropdown) return;
+
+        // Read alliances count from GameService.State (fallback to 2).
+        int alliances = Mathf.Max(1, ServiceLocator.Game?.State?.Alliances ?? 2); // How many alliances now
+
+        // Build numeric options: "Alliance 1", "Alliance 2", ...
+        var options = new List<TMP_Dropdown.OptionData>();          // New options list
+        for (int i = 0; i < alliances; i++)                         // For each alliance index
+            options.Add(new TMP_Dropdown.OptionData($"Alliance {i + 1}")); // Human-friendly
+
+        // Replace options and refresh caption.
+        allianceDropdown.ClearOptions();                            // Wipe old
+        allianceDropdown.AddOptions(options);                       // Add new
+        allianceDropdown.RefreshShownValue();                       // Refresh caption
+    }
+
+    // Update the editable fields to match the currently selected player (use without-notify setters).
+    private void RefreshFieldsFromSelection()
+    {
+        // Snapshot players.
+        var list = _players.GetAll();                               // Copy
+
+        // If no selection, blank fields (without notify).
+        if (_currentIndex < 0 || _currentIndex >= list.Count)
+        {
+            if (nameField) nameField.SetTextWithoutNotify("");      // Blank name
+            if (allianceDropdown) allianceDropdown.SetValueWithoutNotify(0); // Default alliance
+            return;                                                 // Done
+        }
+
+        // Get selected player.
+        var p = list[_currentIndex];                                // Selected data
+
+        // Sync name field without firing callbacks.
+        if (nameField) nameField.SetTextWithoutNotify(p.Name);      // Show name
+
+        // Clamp alliance to current GameService count and apply to dropdown without notify.
+        int alliances = Mathf.Max(1, ServiceLocator.Game?.State?.Alliances ?? 2); // Current count
+        int val = Mathf.Clamp(p.AllianceIndex, 0, alliances - 1);   // Clamp to valid
+        if (allianceDropdown) allianceDropdown.SetValueWithoutNotify(val); // Sync dropdown
+        if (allianceDropdown) allianceDropdown.RefreshShownValue(); // Refresh caption
+    }
+
+    // Helpers to show/hide this panel (optional convenience).
+    public void Show() { if (root) root.SetActive(true); }          // Show panel
+    public void Hide() { if (root) root.SetActive(false); }         // Hide panel
+}
+using System.Globalization;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.UI;
+
+[RequireComponent(typeof(RectTransform))]
+[RequireComponent(typeof(Image))] // makes this object raycastable
+public class RobotControlPanel : MonoBehaviour, IPointerDownHandler, IDragHandler, IPointerUpHandler
+{
+    [Header("Joystick UI")]
+    [SerializeField] private RectTransform baseRect;     // if empty, uses this RectTransform
+    [SerializeField] private RectTransform handleRect;
+
+    [Header("Turret")]
+    [SerializeField] private Slider turretSlider;
+    [SerializeField] private float turretDeadzone = 0.05f;
+
+    [Header("Selection")]
+    [SerializeField] private RobotSelectionPanel selectionPanel;
+
+    [Header("Tuning")]
+    [SerializeField] private float sendHz = 20f;         // max command rate while held
+    [SerializeField] private float changeEpsilon = 0.01f;// only send if changed by this amount
+    [SerializeField] private float resendEvery = 0.25f;  // resend same command while held (0 = never)
+    [SerializeField] private float deadzone = 0.08f;     // stick deadzone
+    [SerializeField] private float maxDeflection = 0.45f;// clamp radius (UI)
+
+    private RobotWebSocketServer _ws;
+    private Camera _uiCam;
+
+    private Vector2 _joy;                  // -1..+1 (x=turn, y=throttle)
+    private Vector2 _lastSent = new Vector2(999, 999);
+    private float _nextSendAt;
+    private float _nextResendAt;
+    private bool _isHeld;                  // true while pointer is down
+
+    private void Awake()
+    {
+        var img = GetComponent<Image>();
+        img.raycastTarget = true;
+        if (img.sprite == null) img.color = new Color(0, 0, 0, 0); // invisible but raycastable
+
+        if (baseRect == null) baseRect = GetComponent<RectTransform>();
+        _uiCam = GetComponentInParent<Canvas>()?.worldCamera;
+
+        _ws = ServiceLocator.RobotServer;
+
+        if (turretSlider != null)
+        {
+            turretSlider.onValueChanged.RemoveAllListeners();
+            turretSlider.onValueChanged.AddListener(OnTurretChanged);
+        }
+    }
+
+    private void OnEnable()
+    {
+        if (selectionPanel != null)
+            selectionPanel.SelectionChanged += OnSelectionChanged;
+        CenterControls();
+    }
+
+    private void OnDisable()
+    {
+        if (selectionPanel != null)
+            selectionPanel.SelectionChanged -= OnSelectionChanged;
+    }
+
+    private void OnSelectionChanged(string _)
+    {
+        // Don’t auto-send stop here; selection panel already handles motors on/off.
+        CenterControls();
+        _lastSent = new Vector2(999, 999);
+    }
+
+    private void CenterControls()
+    {
+        _joy = Vector2.zero;
+        if (handleRect) handleRect.anchoredPosition = Vector2.zero;
+        if (turretSlider) turretSlider.SetValueWithoutNotify(0.5f);
+        _nextSendAt = 0f;
+        _nextResendAt = 0f;
+        _isHeld = false;
+    }
+
+    public void OnPointerDown(PointerEventData e)
+    {
+        _isHeld = true;
+        UpdateHandle(e);
+        // force immediate send on press
+        _nextSendAt = 0f;
+        _nextResendAt = Time.unscaledTime;
+    }
+
+    public void OnDrag(PointerEventData e)
+    {
+        UpdateHandle(e);
+    }
+
+    public void OnPointerUp(PointerEventData e)
+    {
+        _isHeld = false;
+        _joy = Vector2.zero;
+        if (handleRect) handleRect.anchoredPosition = Vector2.zero;
+
+        // Send ONE stop when released
+        var ws = ServiceLocator.RobotServer;
+        var robotId = selectionPanel != null ? selectionPanel.CurrentRobotId : null;
+        if (ws != null && !string.IsNullOrEmpty(robotId))
+        {
+            ws.SendDrive(robotId, 0f, 0f);
+            _lastSent = new Vector2(0f, 0f);
+        }
+    }
+
+    private void UpdateHandle(PointerEventData e)
+    {
+        if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(baseRect, e.position, _uiCam, out var lp))
+            return;
+
+        var half = baseRect.rect.size * 0.5f;
+        var norm = new Vector2(lp.x / half.x, lp.y / half.y);
+        norm = Vector2.ClampMagnitude(norm, maxDeflection);
+
+        if (handleRect) handleRect.anchoredPosition = new Vector2(norm.x * half.x, norm.y * half.y);
+
+        var scaled = norm / Mathf.Max(0.0001f, maxDeflection);   // -1..+1
+        _joy = (scaled.magnitude < deadzone) ? Vector2.zero : Vector2.ClampMagnitude(scaled, 1f);
+    }
+
+    private void Update()
+    {
+        // Only drive while held; turret slider still works via its callback.
+        if (!_isHeld) return;
+
+        if (Time.unscaledTime < _nextSendAt) return;
+        _nextSendAt = Time.unscaledTime + (1f / Mathf.Max(1f, sendHz));
+
+        var ws = ServiceLocator.RobotServer;
+        var robotId = selectionPanel != null ? selectionPanel.CurrentRobotId : null;
+        if (ws == null || string.IsNullOrEmpty(robotId)) return;
+
+        float x = Mathf.Clamp(_joy.x, -1f, 1f); // turn
+        float y = Mathf.Clamp(_joy.y, -1f, 1f); // throttle
+        float left = Mathf.Clamp(y + x, -1f, 1f);
+        float right = Mathf.Clamp(y - x, -1f, 1f);
+
+        bool changed = (Mathf.Abs(left - _lastSent.x) > changeEpsilon) ||
+                       (Mathf.Abs(right - _lastSent.y) > changeEpsilon);
+
+        bool resend = (resendEvery > 0f) && (Time.unscaledTime >= _nextResendAt);
+
+        if (changed || resend)
+        {
+            ws.SendDrive(robotId, left, right);
+            _lastSent = new Vector2(left, right);
+            if (resend) _nextResendAt = Time.unscaledTime + resendEvery;
+        }
+    }
+
+    private void OnTurretChanged(float slider01)
+    {
+        var ws = ServiceLocator.RobotServer;
+        var robotId = selectionPanel != null ? selectionPanel.CurrentRobotId : null;
+        if (ws == null || string.IsNullOrEmpty(robotId)) return;
+
+        float v = Mathf.Lerp(-1f, +1f, slider01);
+        if (Mathf.Abs(v) < turretDeadzone) v = 0f;
+        ws.SendTurret(robotId, v);
+    }
+}
+// RobotSelectionPanel.cs — selection + video + motors on/off on select/deselect.
+// Starts with no selection. Exposes CurrentRobotId and SelectionChanged.
+
+using System;                                            // Bring in basic system types (Action, etc.)
+using System.Collections.Generic;                        // Bring in List<T> and HashSet<T>
+using TMPro;                                             // Bring in TextMeshProUGUI
+using UnityEngine;                                       // Bring in MonoBehaviour and Unity basics
+using UnityEngine.UI;                                    // Bring in Button
+
+public class RobotSelectionPanel : MonoBehaviour
+{
+    [Header("Buttons")]                                  // Header label for button fields in the inspector
+    [SerializeField] private Button prevButton;          // Button to move to the previous robot
+    [SerializeField] private Button nextButton;          // Button to move to the next robot
+    [SerializeField] private Button clearButton;         // Button to clear the current selection
+
+    [Header("Info Labels")]                              // Header label for info label fields
+    [SerializeField] private TextMeshProUGUI nameLabel;  // Label showing the robot name / callsign
+    [SerializeField] private TextMeshProUGUI ipLabel;    // Label showing the robot IP address
+    [SerializeField] private TextMeshProUGUI playerLabel;// Label showing which player owns the robot
+    [SerializeField] private TextMeshProUGUI allianceLabel; // Label showing alliance (placeholder)
+    [SerializeField] private TextMeshProUGUI clientLabel;   // Label showing client info (placeholder)
+
+    [Header("Video")]                                    // Header label for video-related fields
+    [SerializeField] private ESP32VideoReceiver video;   // Reference to the shared video receiver
+
+    private IRobotDirectory _dir;                        // Reference to the robot directory service
+    private RobotWebSocketServer _ws;                    // Reference to the WebSocket server for commands
+    private readonly List<RobotInfo> _list = new();      // Local list of robots for indexing / cycling
+    private int _index = -1;                             // Current index in _list, -1 means "no selection"
+    private string _selectedRobotId;                     // Id of the currently selected robot (or null)
+
+    // NEW: set of robot IDs that are allowed for the current player/turn (null => no filter).
+    private HashSet<string> _allowedSet;                 // When null or empty => all robots are allowed
+
+    public string CurrentRobotId => _selectedRobotId;    // Public getter so other panels can read selection
+
+    public event Action<string> SelectionChanged;        // Event raised whenever the selection changes
+
+    private void Awake()
+    {
+        _dir = ServiceLocator.RobotDirectory;            // Get the global robot directory
+        _ws = ServiceLocator.RobotServer;                // Get the global websocket server
+        if (video == null)                               // If video reference not set in inspector
+            video = ESP32VideoReceiver.Instance;         //   -> fallback to the singleton instance
+    }
+
+    private void OnEnable()
+    {
+        WireButtons();                                   // Hook up button click handlers
+        SubscribeDirectory();                            // Subscribe to directory change events
+        RebuildList();                                   // Populate local robot list from directory
+
+        _index = -1;                                     // Start with no selection
+        _selectedRobotId = null;                         // Clear selected robot id
+        if (video) video.ClearActiveRobot();             // Tell video receiver to clear active robot
+        RefreshUI();                                     // Update labels to reflect "no selection"
+        SelectionChanged?.Invoke(null);                  // Notify listeners that selection is now null
+    }
+
+    private void OnDisable()
+    {
+        UnsubscribeDirectory();                          // Detach from directory events when disabled
+    }
+
+    private void WireButtons()
+    {
+        if (prevButton != null)                          // If a "previous" button is assigned
+        {
+            prevButton.onClick.RemoveAllListeners();     //   -> clear any existing listeners
+            prevButton.onClick.AddListener(Prev);        //   -> hook up the Prev() method
+        }
+
+        if (nextButton != null)                          // If a "next" button is assigned
+        {
+            nextButton.onClick.RemoveAllListeners();     //   -> clear any existing listeners
+            nextButton.onClick.AddListener(Next);        //   -> hook up the Next() method
+        }
+
+        if (clearButton != null)                         // If a "clear selection" button is assigned
+        {
+            clearButton.onClick.RemoveAllListeners();    //   -> clear existing listeners
+            clearButton.onClick.AddListener(ClearSelection); // -> hook up the ClearSelection() method
+        }
+    }
+
+    private void SubscribeDirectory()
+    {
+        if (_dir == null) return;                        // If no directory available, nothing to subscribe to
+
+        _dir.OnRobotAdded += OnRobotAdded;             // Subscribe to robot added event
+        _dir.OnRobotUpdated += OnRobotUpdated;           // Subscribe to robot updated event
+        _dir.OnRobotRemoved += OnRobotRemoved;           // Subscribe to robot removed event
+    }
+
+    private void UnsubscribeDirectory()
+    {
+        if (_dir == null) return;                        // If no directory available, nothing to unsubscribe
+
+        _dir.OnRobotAdded -= OnRobotAdded;             // Unsubscribe from robot added event
+        _dir.OnRobotUpdated -= OnRobotUpdated;           // Unsubscribe from robot updated event
+        _dir.OnRobotRemoved -= OnRobotRemoved;           // Unsubscribe from robot removed event
+    }
+
+    private void RebuildList()
+    {
+        _list.Clear();                                   // Remove all existing entries in local list
+        if (_dir != null)                                // If we have a directory
+            _list.AddRange(_dir.GetAll());               //   -> copy all robots into the local list
+
+        ClampIndexAfterListChange();                     // Ensure the index is still valid after rebuild
+    }
+
+    private void ClampIndexAfterListChange()
+    {
+        if (_list.Count == 0)                            // If there are no robots at all
+        {
+            _index = -1;                                 //   -> ensure index is "no selection"
+            return;                                      //   -> and exit
+        }
+
+        if (_index >= _list.Count)                       // If index is past the last entry
+            _index = -1;                                 //   -> reset to "no selection"
+
+        if (_index < -1)                                 // If index somehow went below -1
+            _index = -1;                                 //   -> clamp it up to -1
+    }
+
+    private void OnRobotAdded(RobotInfo r)
+    {
+        _list.Add(r);                                    // Add the new robot to the local list
+        ClampIndexAfterListChange();                     // Make sure index is still valid
+        RefreshUI();                                     // Update labels in case we were empty before
+    }
+
+    private void OnRobotUpdated(RobotInfo r)
+    {
+        for (int i = 0; i < _list.Count; i++)            // Loop through existing robots
+        {
+            if (_list[i].RobotId == r.RobotId)           //   -> if we find the matching id
+            {
+                _list[i] = r;                            //   -> replace with updated info
+                break;                                   //   -> and stop searching
+            }
+        }
+        RefreshUI();                                     // Robot details may have changed, so refresh labels
+    }
+
+    private void OnRobotRemoved(string robotId)
+    {
+        int idx = _list.FindIndex(x => x.RobotId == robotId); // Find index of robot with this id
+        if (idx >= 0)                                   // If we actually found it
+            _list.RemoveAt(idx);                       //   -> remove it from the local list
+
+        if (_selectedRobotId == robotId)               // If the removed robot was currently selected
+        {
+            _index = -1;                               //   -> clear index
+            _selectedRobotId = null;                   //   -> clear selected id
+            if (video) video.ClearActiveRobot();       //   -> tell video receiver to clear active robot
+        }
+
+        ClampIndexAfterListChange();                   // Ensure index is still within range
+        RefreshUI();                                   // Update labels to reflect removal
+
+        _ws = ServiceLocator.RobotServer;              // Refresh websocket reference in case it changed
+        _ws?.SendMotorsOff(robotId);                   // As a safety measure, turn off motors on removed robot
+
+        SelectionChanged?.Invoke(null);                // Notify listeners that selection may now be null
+    }
+
+    // NEW: helper to check if a robot id is allowed under the current filter.
+    private bool IsAllowed(string robotId)
+    {
+        if (string.IsNullOrEmpty(robotId))             // If id is null/empty
+            return false;                              //   -> treat as not allowed
+
+        if (_allowedSet == null || _allowedSet.Count == 0)
+            return true;                               // If there is no filter, all robots are allowed
+
+        return _allowedSet.Contains(robotId);          // Otherwise only ids in the set are allowed
+    }
+
+    private void Prev()
+    {
+        if (_list.Count == 0)                          // If there are no robots to select
+            return;                                    //   -> nothing to do
+
+        // We want to find the previous robot that is allowed.
+        int startIndex = _index;                       // Remember the starting index
+        if (startIndex < 0)                            // If we currently have no selection
+            startIndex = 0;                            //   -> start searching from the first entry
+
+        for (int i = 0; i < _list.Count; i++)          // Loop at most once through the list
+        {
+            int next = (startIndex - 1 - i + _list.Count) % _list.Count; // Step backwards with wrap-around
+            string id = _list[next].RobotId;           //   -> get the id at that position
+
+            if (IsAllowed(id))                         // If this robot is allowed under filter
+            {
+                SelectIndex(next);                     //   -> select it
+                return;                                //   -> and stop searching
+            }
+        }
+
+        // If we got here, no robots are allowed under the current filter.
+        ClearSelection();                              //   -> clear any current selection
+    }
+
+    private void Next()
+    {
+        if (_list.Count == 0)                          // If there are no robots to select
+            return;                                    //   -> nothing to do
+
+        // We want to find the next robot that is allowed.
+        int startIndex = _index;                       // Remember the starting index
+        if (startIndex < 0)                            // If we currently have no selection
+            startIndex = 0;                            //   -> start searching from the first entry
+
+        for (int i = 0; i < _list.Count; i++)          // Loop at most once through the list
+        {
+            int next = (startIndex + 1 + i) % _list.Count; // Step forwards with wrap-around
+            string id = _list[next].RobotId;           //   -> get the id at that position
+
+            if (IsAllowed(id))                         // If this robot is allowed under filter
+            {
+                SelectIndex(next);                     //   -> select it
+                return;                                //   -> and stop searching
+            }
+        }
+
+        // If we got here, no robots are allowed under the current filter.
+        ClearSelection();                              //   -> clear any current selection
+    }
+
+    private void ClearSelection()
+    {
+        _ws = ServiceLocator.RobotServer;              // Refresh websocket reference
+
+        if (!string.IsNullOrEmpty(_selectedRobotId))   // If we previously had a selected robot
+        {
+            _ws?.SendStreamOff(_selectedRobotId);      //   -> stop its video stream
+            _ws?.SendMotorsOff(_selectedRobotId);      //   -> and stop its motors
+        }
+
+        _index = -1;                                   // Set index to "no selection"
+        _selectedRobotId = null;                       // Clear selected robot id
+
+        if (video) video.ClearActiveRobot();           // Tell video receiver to clear active robot
+        RefreshUI();                                   // Update labels to show "no selection"
+        SelectionChanged?.Invoke(null);                // Notify listeners that selection is now null
+    }
+
+    private void SelectIndex(int newIndex)
+    {
+        if (newIndex < 0 || newIndex >= _list.Count)   // If given index is out of range
+        {
+            ClearSelection();                          //   -> treat as clear request
+            return;                                    //   -> and exit
+        }
+
+        var r = _list[newIndex];                       // Get the robot at the requested index
+
+        if (!IsAllowed(r.RobotId))                     // If this robot is not allowed by filter
+        {
+            ClearSelection();                          //   -> clear selection instead
+            return;                                    //   -> and exit
+        }
+
+        _ws = ServiceLocator.RobotServer;              // Refresh websocket reference
+
+        if (!string.IsNullOrEmpty(_selectedRobotId))   // If there was a previously selected robot
+        {
+            _ws?.SendStreamOff(_selectedRobotId);      //   -> stop its video stream
+            _ws?.SendMotorsOff(_selectedRobotId);      //   -> and stop its motors
+        }
+
+        _index = newIndex;                             // Store the new index
+        _selectedRobotId = r.RobotId;                  // Store the new selected robot id
+
+        if (video)                                     // If we have a video receiver reference
+            video.SetActiveRobot(_selectedRobotId);    //   -> tell it to display this robot
+
+        _ws?.SendStreamOn(_selectedRobotId);           // Ask robot to start sending video
+        _ws?.SendMotorsOn(_selectedRobotId);           // Ask robot to enable motors
+
+        RefreshUI();                                   // Update labels with new robot info
+        SelectionChanged?.Invoke(_selectedRobotId);    // Notify listeners about new selection
+    }
+
+    private void RefreshUI()
+    {
+        if (_index < 0 || _index >= _list.Count)       // If there is no valid selection
+        {
+            if (nameLabel) nameLabel.text = "(no robot selected)"; // Show placeholder name
+            if (ipLabel) ipLabel.text = "";           // Clear IP label
+            if (playerLabel) playerLabel.text = "Player: —";      // Show placeholder player
+            if (allianceLabel) allianceLabel.text = "Alliance: —"; // Show placeholder alliance
+            if (clientLabel) clientLabel.text = "Client: —";      // Show placeholder client
+            return;                                   // Exit after clearing placeholders
+        }
+
+        var r = _list[_index];                        // Get the currently selected robot info
+        string display = string.IsNullOrEmpty(r.Callsign)
+            ? r.RobotId                               // If no callsign, fall back to robot id
+            : r.Callsign;                             // Otherwise show callsign
+
+        if (nameLabel) nameLabel.text = display;      // Update name label
+        if (ipLabel)                                  // If IP label is assigned
+            ipLabel.text = string.IsNullOrEmpty(r.Ip) //   -> if ip is empty
+                ? "(no ip)"                           //      show placeholder
+                : r.Ip;                               //      otherwise show IP string
+
+        // For player label, treat null/empty as "Unassigned" for now.
+        if (playerLabel)
+            playerLabel.text = "Player: " +
+                (string.IsNullOrEmpty(r.AssignedPlayer) ? "Unassigned" : r.AssignedPlayer);
+
+        if (allianceLabel) allianceLabel.text = "Alliance: TBD"; // Alliance info not wired yet
+        if (clientLabel) clientLabel.text = "Client:   TBD"; // Client info not wired yet
+    }
+
+    // NEW: called by GamePanelPresenter to restrict which robots are selectable this turn.
+    public void SetAllowedFilter(IReadOnlyList<string> allowedIds)
+    {
+        if (allowedIds == null || allowedIds.Count == 0) // If no list or empty list is provided
+        {
+            _allowedSet = null;                          //   -> treat as "no filter, all robots allowed"
+            return;                                      //   -> and exit
+        }
+
+        if (_allowedSet == null)                         // If we do not yet have a HashSet
+            _allowedSet = new HashSet<string>();         //   -> allocate one
+
+        _allowedSet.Clear();                             // Clear previous contents
+
+        for (int i = 0; i < allowedIds.Count; i++)       // Loop through provided allowed ids
+        {
+            string id = allowedIds[i];                   //   -> read current id
+            if (!string.IsNullOrEmpty(id))               //   -> ignore null/empty ids
+                _allowedSet.Add(id);                     //   -> add valid id to the set
+        }
+    }
+
+    // NEW: called after SetAllowedFilter to fix selection if it is now invalid.
+    public void EnsureValidSelectionAfterFilter(bool autoSelectFirstAllowed)
+    {
+        // If we currently have a selected robot but it is no longer allowed, clear it.
+        if (!string.IsNullOrEmpty(_selectedRobotId)      // If we have some selection
+            && !IsAllowed(_selectedRobotId))             //   -> and it is not allowed anymore
+        {
+            ClearSelection();                            //   -> clear selection (and notify listeners)
+        }
+
+        // If we have no selection and caller wants auto-select behaviour, choose the first allowed.
+        if (autoSelectFirstAllowed                      // If caller requested auto-selection
+            && string.IsNullOrEmpty(_selectedRobotId))   //   -> and we currently have no selection
+        {
+            for (int i = 0; i < _list.Count; i++)        // Loop through all robots
+            {
+                string id = _list[i].RobotId;            //   -> get id at this index
+                if (IsAllowed(id))                       //   -> if this robot is allowed under filter
+                {
+                    SelectIndex(i);                      //      select it
+                    return;                              //      and stop searching
+                }
+            }
+
+            // If we reach here, no robots are allowed under the current filter.
+            // Selection is already cleared, so nothing more to do.
+        }
+    }
+}
+using UnityEngine;                     // Unity essentials
+using UnityEngine.UI;                  // For Slider
+using UnityEngine.EventSystems;        // For IPointer / IEndDrag
+
+// Attach this to the SAME GameObject that has your Slider component.
+// It will snap the slider back to 0.5 when you release the mouse/finger.
+// Every line is commented to keep it simple.
+public class SliderCenterOnRelease : MonoBehaviour, IPointerUpHandler, IEndDragHandler
+{
+    // A reference to the slider we will control.
+    // If you forget to set it in the Inspector, we will auto-grab it in Awake.
+    [SerializeField] private Slider slider;
+
+    // Called when the script instance is being loaded.
+    private void Awake()
+    {
+        // If the user didn’t plug the slider in, try to find it on this GameObject.
+        if (slider == null) slider = GetComponent<Slider>();
+    }
+
+    // Called when the user releases the mouse/finger over this UI element.
+    public void OnPointerUp(PointerEventData eventData)
+    {
+        // Set the slider back to the middle (0.5 = center).
+        // Using 'slider.value' (not SetValueWithoutNotify) triggers your existing OnValueChanged,
+        // which will send a turret value near zero.
+        if (slider != null) slider.value = 0.5f;
+    }
+
+    // Called when a drag operation ends (e.g., releasing outside the control).
+    public void OnEndDrag(PointerEventData eventData)
+    {
+        // Also snap to center here so it works whether you release on or off the slider.
+        if (slider != null) slider.value = 0.5f;
+    }
+}

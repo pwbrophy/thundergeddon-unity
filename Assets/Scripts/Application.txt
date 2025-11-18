@@ -1,0 +1,714 @@
+using System;
+
+public enum GamePhase { MainMenu, Lobby, Playing, Ended }
+
+public sealed class GameFlow
+{
+    public GamePhase Phase { get; private set; } = GamePhase.MainMenu;
+
+    // Services the flow will call (we’ll plug real ones later)
+    private readonly LobbyService _lobby;
+    private readonly GameService _game;
+
+    // Let UI subscribe to phase changes
+    public event Action<GamePhase> OnPhaseChanged;
+
+    public GameFlow(LobbyService lobby, GameService game)
+    {
+        _lobby = lobby;
+        _game = game;
+    }
+
+    private void SetPhase(GamePhase p)
+    {
+        if (Phase == p) return;
+        Phase = p;
+        OnPhaseChanged?.Invoke(Phase);
+    }
+
+    public bool CanGoToLobby()
+    {
+        return Phase == GamePhase.MainMenu;
+    }
+
+    public void GoToLobby()
+    {
+        if (!CanGoToLobby()) return;
+        SetPhase(GamePhase.Lobby);
+    }
+
+    public bool CanStartGame()
+    { 
+        return Phase == GamePhase.Lobby && _game.CanStart();
+    }
+
+    public void StartGame()
+    {
+        if (!CanStartGame()) return;
+        _game.StartGame(startAP: 5);
+        SetPhase(GamePhase.Playing);
+    }
+
+    public bool CanEndGame()
+    { 
+        return Phase == GamePhase.Playing; 
+    }
+
+    public void EndGame()
+    {
+        if (!CanEndGame()) return;
+        SetPhase(GamePhase.Ended);
+    }
+
+    public void BackToMenu()
+    {
+        // From anywhere, go back to main menu (adjust as you like)
+        SetPhase(GamePhase.MainMenu);
+    }
+}
+// GameService.cs — super small first-pass game bootstrapper
+using System;                                      // For basic types
+using System.Collections.Generic;                  // For List<>
+
+public sealed class GameService
+{
+    // Keep the current game state so the Playing UI can read it.
+    public GameState State { get; private set; }   // Null when no game is running
+
+    // Return true if we are allowed to start a game (very permissive for now).
+    public bool CanStart()
+    {
+        return true;                               // You can add real checks later
+    }
+
+    // Create a new game using the current lobby robots and hard-coded counts.
+    public void StartGame(int startAP)
+    {
+        // Grab the current robot list from the shared directory.
+        var dir = ServiceLocator.RobotDirectory;   // Get the registry of connected robots
+        var robotsNow = dir != null ? dir.GetAll() // Snapshot current robots (in insertion order)
+                                    : Array.Empty<RobotInfo>();
+
+        // Build a brand-new GameState (hard-coded alliances/players/clients as requested).
+        var gs = new GameState
+        {
+            Alliances = 2,                         // Fixed for first pass
+            Players = 2,                         // Fixed for first pass
+            Clients = 2,                         // Fixed for first pass
+            Robots = new List<RobotInfo>(robotsNow) // Copy the robots into game state
+        };
+
+        // Store it so the Playing UI can read from here.
+        State = gs;                                 // Publish the state
+
+        // Nothing else yet (no AP/turn order). Simple by design.
+        // NOTE: Switching Phase to Playing is done by GameFlow.StartGame(). :contentReference[oaicite:4]{index=4}
+        // NOTE: UDP listener stops automatically when leaving Lobby. :contentReference[oaicite:5]{index=5}
+        // NOTE: WS "hello" is only accepted in Lobby, so no new robots join mid-game. :contentReference[oaicite:6]{index=6}
+    }
+}
+// GameState.cs — tiny data bag for the running match (first pass)
+using System;                             // For basic types
+using System.Collections.Generic;         // For List<>
+
+public sealed class GameState             // Holds the snapshot we pass from Lobby -> Game
+{
+    public int Alliances = 2;             // Hard-coded as requested
+    public int Players = 2;             // Hard-coded as requested
+    public int Clients = 2;             // Hard-coded as requested
+
+    public List<RobotInfo> Robots;        // The robots that are in the game (snapshot from Lobby)
+}
+using System;
+using System.Collections.Generic;
+
+// The registry the UI talks to.
+// We keep only robots that are "present".
+// When a robot disappears, call Remove(robotId).
+public interface IRobotDirectory
+{
+    IReadOnlyList<RobotInfo> GetAll();
+
+    // Events that presenters listen to for live updates
+    event Action<RobotInfo> OnRobotAdded;
+    event Action<RobotInfo> OnRobotUpdated;
+    event Action<string> OnRobotRemoved; // robotId
+
+    // Add or update a robot that is present.
+    // If it's new -> added; if it exists -> updated fields (name/ip/player).
+    void Upsert(string robotId, string callsign, string ip);
+
+    // Change editable fields
+    void SetCallsign(string robotId, string newCallsign);
+    void SetAssignedPlayer(string robotId, string playerName);
+
+    // Robot is gone (disconnected or timed out) -> remove from registry
+    bool Remove(string robotId);
+
+    // Remove the most recently added robot (by insertion order)
+    bool RemoveLast();
+
+    // Helper to query
+    bool TryGet(string robotId, out RobotInfo info);
+}
+public sealed class LobbyService
+{
+    // Add lobby stuff later (alliances/armies/robots/devices)
+}
+// PlayerInfo.cs — tiny data container for a player
+// Every line is commented to keep it simple.
+
+public sealed class PlayerInfo
+{
+    // The display name of the player, e.g., "Player1".
+    public string Name;
+
+    // The alliance index this player belongs to (0-based).
+    public int AllianceIndex;
+}
+using System;                                    // For Action
+using System.Collections.Generic;                // For List
+using UnityEngine;                               // For Mathf
+
+// PlayersService — keeps a simple in-memory list of players.
+// NOTE: Alliances count is NOT stored here. We always read it from GameService.State.Alliances.
+public sealed class PlayersService
+{
+    // Fired whenever players list or any player data changes.
+    public event Action OnChanged;
+
+    // Internal list of players in order.
+    private readonly List<PlayerInfo> _players = new List<PlayerInfo>();
+
+    // Expose a safe copy of the players list for readers.
+    public List<PlayerInfo> GetAll()
+    {
+        // Return a new list so callers cannot mutate our internal storage.
+        return new List<PlayerInfo>(_players);
+    }
+
+    // Convenience: fetch current alliances count from GameService.State (fallback to 2 if unavailable).
+    private static int CurrentAlliancesCount()
+    {
+        // Ask the ServiceLocator for Game, then its State, then Alliances; default to 2 if anything is missing.
+        return Mathf.Max(1, ServiceLocator.Game?.State?.Alliances ?? 2);
+    }
+
+    // Add a new player (auto-name if not provided) and return its index.
+    public int AddPlayer(string name = null, int allianceIndex = 0)
+    {
+        // If name not provided, auto-generate "PlayerN".
+        if (string.IsNullOrEmpty(name))
+            name = "Player" + (_players.Count + 1).ToString();
+
+        // Clamp alliance to valid range based on GameService.State.Alliances.
+        int alliances = CurrentAlliancesCount();                // How many alliances exist right now
+        allianceIndex = Mathf.Clamp(allianceIndex, 0, alliances - 1); // Clamp the provided index
+
+        // Create the player data object.
+        var p = new PlayerInfo { Name = name, AllianceIndex = allianceIndex };
+
+        // Append to list.
+        _players.Add(p);
+
+        // Notify listeners that something changed.
+        OnChanged?.Invoke();
+
+        // Return index of the newly added player.
+        return _players.Count - 1;
+    }
+
+    // Remove a player by index; return true if removed.
+    public bool RemovePlayerAt(int index)
+    {
+        // Guard invalid index.
+        if (index < 0 || index >= _players.Count) return false;
+
+        // Remove the player.
+        _players.RemoveAt(index);
+
+        // Notify listeners that the list changed.
+        OnChanged?.Invoke();
+        return true;
+    }
+
+    // Rename a player by index; return true on success.
+    public bool RenamePlayer(int index, string newName)
+    {
+        // Guard inputs.
+        if (index < 0 || index >= _players.Count) return false;   // Invalid index
+        if (string.IsNullOrEmpty(newName)) return false;          // Must have a name
+
+        // Apply new name.
+        _players[index].Name = newName;
+
+        // Notify listeners so UIs can refresh immediately.
+        OnChanged?.Invoke();
+        return true;
+    }
+
+    // Assign a player to an alliance; clamps to current alliances count from GameService.
+    public bool SetPlayerAlliance(int index, int allianceIndex)
+    {
+        // Guard invalid index.
+        if (index < 0 || index >= _players.Count) return false;
+
+        // Clamp alliance using the CURRENT GameService value.
+        int alliances = CurrentAlliancesCount();                   // Read from GameService.State
+        allianceIndex = Mathf.Clamp(allianceIndex, 0, alliances - 1); // Clamp to valid range
+
+        // Apply the change.
+        _players[index].AllianceIndex = allianceIndex;
+
+        // Notify listeners.
+        OnChanged?.Invoke();
+        return true;
+    }
+
+    // Ensure there are two defaults if list is empty (Player1?Alliance 0, Player2?Alliance 1).
+    public void EnsureDefaults()
+    {
+        // If already populated, nothing to do.
+        if (_players.Count > 0) return;
+
+        // Read alliances count (in case the game configured a different number).
+        int alliances = CurrentAlliancesCount();                   // How many alliances exist
+
+        // Add Player1 in Alliance 0.
+        AddPlayer("Player1", 0);
+
+        // Add Player2 in Alliance 1 (or 0 if only one alliance).
+        AddPlayer("Player2", alliances > 1 ? 1 : 0);
+    }
+}
+using System;
+using System.Collections.Generic;
+
+public class RobotDirectory : IRobotDirectory
+{
+    // store the robots by id (fast lookup)
+    private readonly Dictionary<string, RobotInfo> _byId = new();
+
+    // NEW: track insertion order so we know which was "last added"
+    private readonly List<string> _order = new();
+
+    public event Action<RobotInfo> OnRobotAdded;
+    public event Action<RobotInfo> OnRobotUpdated;
+    public event Action<string> OnRobotRemoved;
+
+    // Return robots in insertion order
+    public IReadOnlyList<RobotInfo> GetAll()
+    {
+        List<RobotInfo> list = new List<RobotInfo>(_order.Count);
+        for (int i = 0; i < _order.Count; i++)
+        {
+            string id = _order[i];
+            if (_byId.TryGetValue(id, out var info))
+            {
+                list.Add(info);
+            }
+        }
+        return list;
+    }
+
+    public bool TryGet(string robotId, out RobotInfo info)
+    {
+        return _byId.TryGetValue(robotId, out info);
+    }
+
+    // Treat this as "insert or update". We ignore online/offline entirely.
+    public void Upsert(string robotId, string callsign, string ip)
+    {
+        // Guard against bad ids – if the id is blank there is nothing sensible to do.
+        if (string.IsNullOrWhiteSpace(robotId)) return;                      // Ignore empty / whitespace ids
+
+        // Look up the robot in our dictionary.
+        if (!_byId.TryGetValue(robotId, out var r))                          // Is this a brand-new robot?
+        {
+            // Build a brand-new RobotInfo record for this robot.
+            r = new RobotInfo                                                // Allocate a new RobotInfo
+            {
+                RobotId = robotId,                                           // Store the unique id
+                Callsign = string.IsNullOrWhiteSpace(callsign)               // Decide display name
+                    ? GenerateGenericName()                                  //   -> auto name like "robot-01"
+                    : callsign.Trim(),                                       //   -> or trimmed callsign from caller
+                Ip = ip ?? "",                                               // Store IP, or empty string if null
+                AssignedPlayer = null,                                       // IMPORTANT: null means "unassigned"
+                                                                             // Any other fields (IsOnline etc) are left at their defaults.
+            };
+
+            // Register the new robot in our data structures.
+            _byId.Add(robotId, r);                                           // Add to dictionary for fast lookup
+            _order.Add(robotId);                                             // Track insertion order
+            OnRobotAdded?.Invoke(r);                                         // Notify listeners a robot was added
+        }
+        else                                                                 // We already know this robot
+        {
+            // For an existing robot, only update fields if they actually change.
+            bool changed = false;                                            // Track if any fields changed
+
+            // Update callsign if a non-blank one was provided.
+            if (!string.IsNullOrWhiteSpace(callsign))                        // Did caller supply a name?
+            {
+                string newName = callsign.Trim();                            // Normalise provided name
+                if (r.Callsign != newName)                                   // Only if it's different
+                {
+                    r.Callsign = newName;                                    // Store new name
+                    changed = true;                                          // Mark as changed
+                }
+            }
+
+            // Update IP if the caller passed a non-null value that differs from current.
+            if (ip != null && r.Ip != ip)                                    // Did IP actually change?
+            {
+                r.Ip = ip;                                                   // Store new IP
+                changed = true;                                              // Mark as changed
+            }
+
+            // Only fire the update event if something really changed.
+            if (changed)                                                     // Any changes at all?
+            {
+                OnRobotUpdated?.Invoke(r);                                   // Notify listeners
+            }
+        }
+    }
+
+
+    public void SetCallsign(string robotId, string newCallsign)
+    {
+        if (string.IsNullOrWhiteSpace(newCallsign)) return;
+        if (_byId.TryGetValue(robotId, out var r))
+        {
+            string trimmed = newCallsign.Trim();
+            if (r.Callsign != trimmed)
+            {
+                r.Callsign = trimmed;
+                OnRobotUpdated?.Invoke(r);
+            }
+        }
+    }
+
+    // New logic: setting an empty / null player name now *clears* the assignment.
+    public void SetAssignedPlayer(string robotId, string playerName)
+    {
+        // First make sure the robot exists; if not, quietly do nothing.
+        if (!_byId.TryGetValue(robotId, out var r)) return;                  // Unknown id -> ignore
+
+        // Normalise the input: null / empty / whitespace all become "no assignment".
+        string normalized = string.IsNullOrWhiteSpace(playerName)            // Is the name blank?
+            ? null                                                           //   -> store null for "unassigned"
+            : playerName.Trim();                                             //   -> otherwise store trimmed name
+
+        // Only update the record if the value really changed.
+        if (r.AssignedPlayer != normalized)                                  // Different from existing?
+        {
+            r.AssignedPlayer = normalized;                                   // Store new (or cleared) assignment
+            OnRobotUpdated?.Invoke(r);                                       // Notify listeners (UI, TurnManager)
+        }
+    }
+
+    public bool Remove(string robotId)
+    {
+        // Remove from dictionary
+        bool removedDict = _byId.Remove(robotId);
+
+        if (removedDict)
+        {
+            // Also remove from insertion order list
+            int idx = _order.IndexOf(robotId);
+            if (idx >= 0) _order.RemoveAt(idx);
+
+            OnRobotRemoved?.Invoke(robotId);
+            return true;
+        }
+        return false;
+    }
+
+    // NEW: remove the most recently added robot (by insertion order)
+    public bool RemoveLast()
+    {
+        if (_order.Count == 0) return false;
+
+        // last id that was inserted
+        string lastId = _order[_order.Count - 1];
+
+        // defer to existing Remove logic to keep everything in sync + raise events
+        return Remove(lastId);
+    }
+
+    // Simple generator for "robot-01", "robot-02", ...
+    private int _genericCounter = 0;
+    private string GenerateGenericName()
+    {
+        _genericCounter = _genericCounter + 1;
+        return $"robot-{_genericCounter:00}";
+    }
+}
+// Minimal robot data stored by the registry.
+// In real life you'll add more fields (battery, firmware, etc.)
+public class RobotInfo
+{
+    public string RobotId;         // stable unique id (e.g., MAC-based) - the "key"
+    public string Callsign;        // nice display name (editable)
+    public string Ip;              // last-known local IP
+    public string AssignedPlayer;  // "Player1" or "Player2" for now
+
+}
+using System;                                      // For Action
+using System.Collections.Generic;                  // For List and Dictionary
+using UnityEngine;                                 // For Debug.Log and Mathf
+
+/// <summary>
+/// TurnManager — rotates turns across players inside an alliance, then advances to the next alliance.
+/// Data wiring:
+///   - Alliances count comes from ServiceLocator.Game.State.Alliances.
+///   - Players and their alliance indices come from ServiceLocator.Players.
+///   - Robots filter by RobotInfo.AssignedPlayer (player name string).
+/// Events:
+///   - TurnChanged(allianceIndex, playerIndexInAlliance, allowedRobotIds)
+///     * playerIndexInAlliance is -1 if the alliance has no players.
+///     * Use CurrentPlayerName to show a label-friendly name.
+/// </summary>
+public sealed class TurnManager
+{
+    // Fired whenever the current turn changes (after model rebuilds or EndTurn).
+    public event Action<int, int, List<string>> TurnChanged;
+
+    // Reference to robot directory (to read robots + get change notifications).
+    private IRobotDirectory _dir;
+
+    // Reference to players service (to read players + get change notifications).
+    private PlayersService _players;
+
+    // Cached count of alliances from GameService.State (we recompute on rebuild).
+    private int _alliances = 2;
+
+    // Per-alliance list of player names (index = alliance; value = list of player names in that alliance).
+    private readonly List<List<string>> _playersByAlliance = new List<List<string>>();
+
+    // Map from player name ? list of robot IDs currently assigned to that player.
+    private readonly Dictionary<string, List<string>> _robotsByPlayer = new Dictionary<string, List<string>>();
+
+    // Scratch list we reuse when publishing allowed robot IDs (to avoid heap churn).
+    private readonly List<string> _scratch = new List<string>();
+
+    // Current alliance index (0-based).
+    private int _curAlliance = 0;
+
+    // Current player index within the current alliance list (0-based, or -1 when no players).
+    private int _curPlayer = -1;
+
+    // Expose current alliance index for UI.
+    public int CurrentAlliance => _curAlliance;
+
+    // Expose current player index within alliance (can be -1).
+    public int CurrentPlayerIndex => _curPlayer;
+
+    // Expose current player name (null if the current alliance has no players).
+    public string CurrentPlayerName
+    {
+        get
+        {
+            // If alliance has no players, return null.
+            if (_curAlliance < 0 || _curAlliance >= _playersByAlliance.Count) return null;      // Guard
+            var list = _playersByAlliance[_curAlliance];                                         // Get list
+            if (_curPlayer < 0 || _curPlayer >= list.Count) return null;                        // Guard
+            return list[_curPlayer];                                                            // Name
+        }
+    }
+
+
+    public void Initialize(IRobotDirectory dir)
+    {
+        // Remember the robot directory so we can read robots and subscribe to its events.
+        _dir = dir;                                                         // Store directory reference
+
+        // Grab the shared PlayersService (normally created once in AppBootstrap).
+        _players = ServiceLocator.Players;                                  // Cache players service
+
+        // Safety net: if AppBootstrap was missing for some reason, create one on the fly.
+        if (_players == null)                                              // No players service yet?
+        {
+            Debug.LogWarning("[TurnManager] ServiceLocator.Players was null; creating a new PlayersService."); // Warn
+            _players = new PlayersService();                                // Allocate a fresh service
+            _players.EnsureDefaults();                                      // Seed it with default players
+            ServiceLocator.Players = _players;                              // Register globally so UI sees same instance
+        }
+
+        // Subscribe to robot directory changes so turns update when robots change.
+        _dir.OnRobotAdded -= OnDirectoryChanged;                          // Ensure no duplicate subscriptions
+        _dir.OnRobotUpdated -= OnDirectoryChanged;                          // "
+        _dir.OnRobotRemoved -= OnDirectoryChanged;                          // "
+        _dir.OnRobotAdded += OnDirectoryChanged;                          // Listen for added robots
+        _dir.OnRobotUpdated += OnDirectoryChanged;                          // Listen for updated robots
+        _dir.OnRobotRemoved += OnDirectoryChanged;                          // Listen for removed robots
+
+        // Subscribe to player list changes so alliances / allowed robots stay in sync.
+        _players.OnChanged -= OnPlayersChanged;                            // Clear any old subscription
+        _players.OnChanged += OnPlayersChanged;                            // Listen for add/remove/rename/alliance
+
+        // Build internal structures and publish the very first turn.
+        RebuildModel();                                                     // Build players-by-alliance & robots-by-player
+        PublishTurn();                                                      // Fire TurnChanged for the initial state
+    }
+
+
+    /// <summary>
+    /// Advance the turn to the next player within the same alliance; if done, move to next alliance.
+    /// </summary>
+    public void EndTurn()
+    {
+        // If there are no alliances (should not happen), publish as-is.
+        if (_alliances <= 0) { PublishTurn(); return; }                                         // Safety
+
+        // Fetch current alliance's player list (or empty).
+        var list = (_curAlliance >= 0 && _curAlliance < _playersByAlliance.Count)
+            ? _playersByAlliance[_curAlliance]
+            : new List<string>();                                                               // Guard to empty
+
+        // If this alliance has at least one player, try next player.
+        if (list.Count > 0)
+        {
+            // Move to next player (wrap around within alliance).
+            _curPlayer = (_curPlayer + 1) % list.Count;                                         // Next player
+            // If we wrapped back to zero, it means all players in this alliance have played ? move to next alliance.
+            if (_curPlayer == 0)
+            {
+                // Advance to next alliance (wrap across all alliances).
+                _curAlliance = (_curAlliance + 1) % _alliances;                                 // Next alliance
+                // Snap player index for the new alliance.
+                _curPlayer = FirstValidPlayerIndex(_curAlliance);                                // Pick first or -1
+            }
+        }
+        else
+        {
+            // No players in this alliance ? go to the next alliance that has players (or keep -1 if none).
+            int safety = _alliances;                                                             // Prevent infinite loop
+            do
+            {
+                _curAlliance = (_curAlliance + 1) % _alliances;                                 // Next alliance
+                _curPlayer = FirstValidPlayerIndex(_curAlliance);                              // First player or -1
+                safety--;
+            }
+            while (_curPlayer == -1 && safety > 0);                                              // Skip empty alliances
+        }
+
+        // Publish the new turn.
+        PublishTurn();                                                                           // Fire event
+    }
+
+    /// <summary>
+    /// Handle any robot directory change — rebuild and publish.
+    /// </summary>
+    private void OnDirectoryChanged(RobotInfo _)
+    {
+        // Rebuild model because assignments/names might have changed.
+        RebuildModel();                                                                          // Recompute
+        PublishTurn();                                                                           // Notify
+    }
+
+    /// <summary>
+    /// Handle removal event variant (by id) — rebuild and publish.
+    /// </summary>
+    private void OnDirectoryChanged(string _)
+    {
+        // Same as above.
+        RebuildModel();                                                                          // Recompute
+        PublishTurn();                                                                           // Notify
+    }
+
+    /// <summary>
+    /// Handle players list changes — rebuild and publish.
+    /// </summary>
+    private void OnPlayersChanged()
+    {
+        // Rebuild model in case names or alliances changed.
+        RebuildModel();                                                                          // Recompute
+        PublishTurn();                                                                           // Notify
+    }
+
+    /// <summary>
+    /// Recompute alliances, their player lists, and the robots-per-player mapping.
+    /// </summary>
+    private void RebuildModel()
+    {
+        // Read alliances count from GameService.State (fallback to 2).
+        _alliances = Mathf.Max(1, ServiceLocator.Game?.State?.Alliances ?? 2);                   // #Alliances
+
+        // Clear and size the per-alliance player array.
+        _playersByAlliance.Clear();                                                              // Reset list
+        for (int a = 0; a < _alliances; a++) _playersByAlliance.Add(new List<string>());        // Allocate each bucket
+
+        // Fill players into the correct alliance bucket by their Name.
+        var plist = ServiceLocator.Players.GetAll();                                             // Snapshot players
+        for (int i = 0; i < plist.Count; i++)                                                    // For every player
+        {
+            int a = Mathf.Clamp(plist[i].AllianceIndex, 0, _alliances - 1);                      // Clamp alliance
+            string name = string.IsNullOrEmpty(plist[i].Name) ? $"Player{i + 1}" : plist[i].Name;// Safe name
+            _playersByAlliance[a].Add(name);                                                     // Store name in alliance
+        }
+
+        // Rebuild robots-per-player mapping.
+        _robotsByPlayer.Clear();                                                                 // Reset map
+        var rlist = _dir.GetAll();                                                               // Snapshot robots
+        for (int i = 0; i < rlist.Count; i++)                                                    // For every robot
+        {
+            string pn = rlist[i].AssignedPlayer;                                                 // Player name string
+            if (string.IsNullOrEmpty(pn)) continue;                                              // Skip unassigned
+            if (!_robotsByPlayer.TryGetValue(pn, out var ids))
+            {
+                ids = new List<string>();                                                        // Create new list
+                _robotsByPlayer[pn] = ids;                                                       // Put in map
+            }
+            ids.Add(rlist[i].RobotId);                                                           // Add this robot id
+        }
+
+        // Clamp the current alliance index.
+        _curAlliance = Mathf.Clamp(_curAlliance, 0, _alliances - 1);                             // Clamp alliance
+
+        // Ensure current player index is valid for the current alliance.
+        if (FirstValidPlayerIndex(_curAlliance) == -1)                                           // If no players here
+            _curPlayer = -1;                                                                      // No player
+        else
+        {
+            var list = _playersByAlliance[_curAlliance];                                         // Player list
+            if (_curPlayer < 0 || _curPlayer >= list.Count) _curPlayer = 0;                      // Snap to 0
+        }
+    }
+
+    /// <summary>
+    /// Returns the first valid player index for the given alliance, or -1 if none.
+    /// </summary>
+    private int FirstValidPlayerIndex(int alliance)
+    {
+        // Guard out-of-range alliances.
+        if (alliance < 0 || alliance >= _playersByAlliance.Count) return -1;                     // Invalid
+        // If there are players, first index is 0; otherwise -1.
+        return _playersByAlliance[alliance].Count > 0 ? 0 : -1;                                   // 0 or -1
+    }
+
+    /// <summary>
+    /// Publish TurnChanged with the allowed robots for the current player.
+    /// </summary>
+    private void PublishTurn()
+    {
+        // Start fresh scratch list.
+        _scratch.Clear();                                                                         // Empty
+
+        // Figure out the current player's name (null if no players in this alliance).
+        string playerName = CurrentPlayerName;                                                    // Resolve name
+
+        // If we have a player, copy their robot IDs (if any) into scratch.
+        if (!string.IsNullOrEmpty(playerName) && _robotsByPlayer.TryGetValue(playerName, out var ids))
+        {
+            for (int i = 0; i < ids.Count; i++) _scratch.Add(ids[i]);                            // Copy IDs
+        }
+
+        // Debug so you can see state transitions easily.
+        var label = string.IsNullOrEmpty(playerName) ? "—" : playerName;                          // Friendly name
+        Debug.Log($"[Turn] Alliance={_curAlliance + 1} Player={label} Robots={_scratch.Count}");  // Trace
+
+        // Fire the event (player index can be -1 if no players in alliance).
+        TurnChanged?.Invoke(_curAlliance, _curPlayer, _scratch);                                  // Notify
+    }
+}

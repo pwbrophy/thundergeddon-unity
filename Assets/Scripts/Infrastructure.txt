@@ -1,0 +1,774 @@
+using System;            // For Action events
+
+// Which side are we running as? (Picked from the Main Menu)
+public enum AppMode
+{
+    None,                // No mode chosen yet (at startup / main menu)
+    Server,              // We act as the game server (host)
+    Client               // We act as a client (phone/controller later)
+}
+
+// Simple service that stores the current mode and notifies listeners when it changes.
+public class AppModeService
+{
+    // Current mode value (read-only from outside; change via SetMode)
+    public AppMode Mode { get; private set; } = AppMode.None;
+
+    // Event fired whenever Mode changes.
+    public event Action<AppMode> OnModeChanged;
+
+    // Set the mode (e.g., from a UI button) and notify listeners if it changed.
+    public void SetMode(AppMode newMode)
+    {
+        if (newMode == Mode) return;  // No change ? do nothing
+        Mode = newMode;               // Store the new mode
+        OnModeChanged?.Invoke(Mode);  // Tell everyone that mode just changed
+    }
+}
+// ESP32VideoReceiver.cs — receives JPEG bytes per robot and shows the active robot's stream
+using UnityEngine;                              // For MonoBehaviour, Texture2D, Debug
+using UnityEngine.UI;                           // For RawImage
+
+public sealed class ESP32VideoReceiver : MonoBehaviour
+{
+    public static ESP32VideoReceiver Instance;  // Singleton instance any code can call
+
+    [Header("UI target (assign a RawImage in the Inspector)")]
+    [SerializeField] private RawImage target;   // Where the video appears
+
+    private Texture2D _tex;                     // Reusable texture for decoded JPEGs
+    private string _activeRobotId;              // Robot whose frames we accept/render
+    private int _frameCount;                    // How many frames we have rendered
+    private int _lastLogged;                    // Last count we logged (for throttling)
+
+    private void Awake()                        // Unity lifecycle: object creation
+    {
+        Debug.Log("Video Receiver Awake"); // Log for awareness)
+        if (Instance != null && Instance != this) { Destroy(gameObject); return; } // Enforce singleton
+        Instance = this;                        // Register singleton
+
+        _tex = new Texture2D(2, 2, TextureFormat.RGB24, false); // Small placeholder texture
+        if (target != null) target.texture = _tex; // Ensure the RawImage uses our texture
+    }
+
+    public void SetActiveRobot(string robotId)  // Called when user selects a robot to view
+    {
+        
+        _activeRobotId = robotId;               // Remember which robot to display
+        _frameCount = 0;                        // Reset counters on switch
+        _lastLogged = -1;                       // Force immediate first log
+        Debug.Log($"[VideoRX] Active robot set to {robotId}"); // Log selection
+
+        if (target != null && _tex != null)     // If we have a UI and texture
+        {
+            _tex.Reinitialize(2, 2);            // Reset texture to tiny size (clears previous image)
+            _tex.Apply(false, false);           // Upload blank texture to GPU
+            target.texture = _tex;              // Reassign to be safe
+            // Optional: fit the RawImage to the incoming frame sizes automatically:
+            // target.SetNativeSize();
+        }
+    }
+
+    public void ClearActiveRobot()                          // Deselect and blank the display
+    {
+        _activeRobotId = null;                              // No active robot
+        if (target != null && _tex != null)                 // If UI is wired
+        {
+            _tex.Reinitialize(2, 2);                        // Reset to tiny texture (appears blank)
+            _tex.Apply(false, false);                       // Apply
+            target.texture = _tex;                          // Keep bound
+        }
+    }
+
+    public void SetTarget(RawImage ri)          // Optional: assign target from code instead of Inspector
+    {
+        target = ri;                             // Store the UI control
+        if (target != null && _tex != null)      // If both exist
+            target.texture = _tex;               // Ensure UI shows our texture
+    }
+
+    public void ReceiveFrame(string robotId, byte[] jpegBytes) // Host calls this on the main thread
+    {
+        
+        if (string.IsNullOrEmpty(_activeRobotId)) return;      // Nothing selected yet
+        if (robotId != _activeRobotId) return;                 // Ignore frames from other robots
+        if (jpegBytes == null || jpegBytes.Length == 0) return;// Ignore empties
+        if (_tex == null) return;                              // Shouldn't happen
+
+        // Decode the JPEG into our reusable Texture2D (LoadImage auto-resizes the texture as needed).
+        bool decoded = _tex.LoadImage(jpegBytes, markNonReadable: false); // Keep it readable for future decodes
+        if (!decoded)                                                     // If decode failed
+        {
+            Debug.LogWarning($"[VideoRX] JPEG decode failed (len={jpegBytes.Length})"); // Warn once
+            return;                                                       // Bail out
+        }
+
+        _tex.Apply(false, false);                 // Upload pixels to GPU (no mipmaps, keep readable)
+
+        if (target != null && target.texture != _tex) // If RawImage lost our texture
+            target.texture = _tex;                // Reassign it
+
+        _frameCount++;                            // Bump frame counter
+
+        // Throttle logs to every 15 frames to avoid spam, but still prove progress.
+        if (_frameCount / 15 != _lastLogged / 15) // If we crossed another 15-frame boundary
+        {
+            _lastLogged = _frameCount;           // Remember milestone
+            //Debug.Log($"[VideoRX] Frames displayed: {_frameCount} (last JPEG {jpegBytes.Length} bytes)"); // Log
+        }
+    }
+}
+// RobotWebSocketServer.cs — WebSocket host for ESP32 robots (text control + binary JPEG frames)
+using System;                                   // Basic C# types
+using System.Collections.Generic;               // Dictionary, List, Queue
+using UnityEngine;                              // MonoBehaviour, Debug, Time
+using WebSocketSharp;                           // MessageEventArgs, CloseEventArgs
+using WebSocketSharp.Server;                    // WebSocketServer, WebSocketBehavior
+using System.Globalization;
+
+public class RobotWebSocketServer : MonoBehaviour
+{
+    [Header("WebSocket Host Settings")]
+    public int Port = 8080;                     // ws://<ip>:8080
+    public string Path = "/esp32";              // ws://<ip>:<port>/esp32
+
+    [Header("Timeouts")]
+    public float TimeoutSeconds = 8f;           // Heartbeat timeout
+    public float SweepIntervalSeconds = 2f;     // How often we scan for timeouts
+
+    [Header("Debug")]
+    public bool VerboseJoins = true;            // Log hellos
+    public bool VerboseLeaves = true;           // Log disconnects
+    public bool VerboseHeartbeats = false;      // (optional) log heartbeats
+
+    // --- State / services ---
+    private bool serverStarted = false;         // Have we started the WSS?
+    private WebSocketServer _wss;               // The WebSocket server
+    private IRobotDirectory _dir;               // Robot registry (via ServiceLocator)
+    private GameFlow _flow;                     // Game phase (Lobby/Playing)
+
+    // Per-session data
+    private class SessionInfo
+    {
+        public string RobotId;                  // Bound after {"cmd":"hello","id":"..."}
+        public float LastSeenTime;              // Time.time (s) of last heartbeat
+        public int NumFrames;                   // Diagnostics: number of JPEG frames received
+    }
+
+    // Maps sessionId -> info, and robotId -> sessionId
+    private readonly Dictionary<string, SessionInfo> _bySession = new Dictionary<string, SessionInfo>();
+    private readonly Dictionary<string, string> _sessionByRobot = new Dictionary<string, string>();
+
+    // Main-thread queue for Unity safety
+    private readonly Queue<Action> _main = new Queue<Action>();
+    private readonly object _mtx = new object();
+
+    // Timeout sweep timer
+    private float _nextSweepTime = 0f;
+
+    // Expose via ServiceLocator
+    private static RobotWebSocketServer _self;
+
+    private void Awake()
+    {
+        _self = this;
+        ServiceLocator.RobotServer = this;
+    }
+
+    private void OnDestroy()
+    {
+        if (_self == this) _self = null;
+        if (ServiceLocator.RobotServer == this) ServiceLocator.RobotServer = null;
+        StopServer();
+    }
+
+    // ===== Public control =====
+
+    public void StartWebSocketServer()
+    {
+        if (serverStarted) return;
+
+        _dir = ServiceLocator.RobotDirectory;  // This is IRobotDirectory in your codebase
+        _flow = ServiceLocator.GameFlow;
+
+        if (_dir == null || _flow == null)
+        {
+            Debug.LogError("[WS] RobotDirectory or GameFlow is null.");
+            return;
+        }
+
+        string ip = PetersUtils.GetLocalIPAddress().ToString();
+        string addr = "ws://" + ip + ":" + Port;
+
+        Debug.Log("[WS] Starting server at " + addr + Path);
+
+        _wss = new WebSocketServer(addr);
+        _wss.KeepClean = false;
+
+        // Add one service at the configured path; each client gets its own ESP32Service instance
+        _wss.AddWebSocketService<ESP32Service>(Path, svc =>
+        {
+            svc.Parent = this;                  // allow the service to call back into this host
+        });
+
+        _wss.Start();
+        Debug.Log("[WS] Started");
+
+        _nextSweepTime = Time.time + SweepIntervalSeconds;
+        serverStarted = true;
+
+        ServiceLocator.RobotServer = this;      // keep SL current
+    }
+
+    public void StopServer()
+    {
+        if (!serverStarted) return;
+        try { _wss.Stop(); } catch { /* ignore */ }
+        _wss = null;
+        serverStarted = false;
+    }
+
+    // ===== Unity Update loop =====
+
+    private void Update()
+    {
+        PumpMain();
+
+        if (serverStarted && Time.time >= _nextSweepTime)
+        {
+            _nextSweepTime = Time.time + SweepIntervalSeconds;
+            SweepForTimeouts();
+        }
+    }
+
+    // Post work to run on Unity main thread
+    public void PostMain(Action a)
+    {
+        if (a == null) return;
+        lock (_mtx) _main.Enqueue(a);
+    }
+
+    private void PumpMain()
+    {
+        for (; ; )
+        {
+            Action a = null;
+            lock (_mtx)
+            {
+                if (_main.Count == 0) break;
+                a = _main.Dequeue();
+            }
+            try { a?.Invoke(); }
+            catch (Exception ex) { Debug.LogException(ex); }
+        }
+    }
+
+    // ===== Behavior for each WebSocket connection =====
+
+    private class ESP32Service : WebSocketBehavior
+    {
+        public RobotWebSocketServer Parent;
+
+        protected override void OnOpen()
+        {
+            if (Parent != null) Parent.PostMain(() => Parent.OnOpened(ID));
+        }
+
+        protected override void OnClose(CloseEventArgs e)
+        {
+            if (Parent != null) Parent.PostMain(() => Parent.OnClosed(ID, e));
+        }
+
+        protected override void OnMessage(MessageEventArgs e)
+        {
+            if (Parent == null) return;
+
+            if (e.IsText)
+            {
+                //Debug.Log("Text message received: " + e.Data);
+                string data = e.Data; // capture text on IO thread
+                Parent.PostMain(() => Parent.HandleText(ID, data));
+                return;
+            }
+
+            if (e.IsBinary)
+            {
+                // Safe to pass RawData; we immediately hop to main thread and use it there.
+                //Debug.Log("Binary message received, len=" + (e.RawData?.Length ?? 0));
+                var bytes = e.RawData;
+                Parent.PostMain(() => Parent.HandleBinary(ID, bytes));
+                return;
+            }
+        }
+    }
+
+    // ===== Host callbacks for service =====
+
+    private void OnOpened(string sid)
+    {
+        if (!_bySession.ContainsKey(sid))
+        {
+            _bySession[sid] = new SessionInfo
+            {
+                RobotId = null,
+                LastSeenTime = Time.time,
+                NumFrames = 0
+            };
+        }
+    }
+
+    private void OnClosed(string sid, CloseEventArgs e)
+    {
+        if (_bySession.TryGetValue(sid, out var info))
+        {
+            var rid = info.RobotId;
+
+            _bySession.Remove(sid);
+
+            if (!string.IsNullOrEmpty(rid))
+            {
+                if (_sessionByRobot.TryGetValue(rid, out var mapSid) && mapSid == sid)
+                    _sessionByRobot.Remove(rid);
+
+                _dir?.Remove(rid); // your directory uses Remove(robotId)
+                if (VerboseLeaves) Debug.Log("[WS] Robot left: " + rid);
+            }
+        }
+    }
+
+    // Handle text JSON (hello + heartbeat)
+    public void HandleText(string sid, string json)
+    {
+        if (string.IsNullOrEmpty(json)) return;
+
+        string cmd = ExtractString(json, "cmd");
+        if (string.IsNullOrEmpty(cmd)) return;
+
+        if (cmd == "hello")
+        {
+            // You only accept new hellos in Lobby
+            if (_flow != null && _flow.Phase != GamePhase.Lobby)
+            {
+                // Politely close: must close a *service* session, not the server.
+                try { ServiceSessions()?.CloseSession(sid); } catch { /* ignore */ }
+                return;
+            }
+
+            string id = ExtractString(json, "id");
+            if (string.IsNullOrEmpty(id)) return;
+
+            if (!_bySession.TryGetValue(sid, out var info))
+            {
+                info = new SessionInfo();
+                _bySession[sid] = info;
+            }
+            info.RobotId = id;
+            info.LastSeenTime = Time.time;
+            info.NumFrames = 0;
+
+            _sessionByRobot[id] = sid;
+
+            // Upsert into the directory (no Get/Add/Touch in your interface)
+            // We don't know the IP here, so pass empty for now.
+            _dir?.Upsert(id, id, ip: "");
+
+            if (VerboseJoins) Debug.Log("[WS] Robot hello: " + id);
+            return;
+        }
+
+        if (cmd == "hb")
+        {
+            if (_bySession.TryGetValue(sid, out var info))
+            {
+                info.LastSeenTime = Time.time;
+                if (VerboseHeartbeats && info.NumFrames % 30 == 0)
+                    Debug.Log("[WS] hb from " + (info.RobotId ?? sid));
+            }
+            return;
+        }
+
+        // (extend for other text commands if you add them later)
+    }
+
+    // Handle one binary JPEG frame (on main thread)
+    public void HandleBinary(string sid, byte[] data)
+    {
+        //Debug.Log("Binary frame received, len=" + (data?.Length ?? 0));
+        if (data == null || data.Length == 0) return;
+
+        if (!_bySession.TryGetValue(sid, out var info)) return;
+        string robotId = info.RobotId;
+        if (string.IsNullOrEmpty(robotId)) return;
+
+        info.NumFrames++;
+        //if ((info.NumFrames % 10) == 0)
+            //Debug.Log($"[WS] {robotId} frames: {info.NumFrames}, last {data.Length} bytes");
+
+        var rx = ESP32VideoReceiver.Instance;
+        //Debug.Log("Passing frame to VideoReceiver for robot " + robotId);
+        if (rx != null) rx.ReceiveFrame(robotId, data);
+    }
+
+    // Periodic heartbeat timeout sweep
+    private void SweepForTimeouts()
+    {
+        if (_bySession.Count == 0) return;
+
+        var now = Time.time;
+        var toDrop = new List<string>();
+
+        foreach (var kv in _bySession)
+        {
+            if (now - kv.Value.LastSeenTime > TimeoutSeconds)
+                toDrop.Add(kv.Key);
+        }
+
+        foreach (var sid in toDrop)
+        {
+            if (_bySession.TryGetValue(sid, out var info))
+            {
+                var rid = info.RobotId;
+
+                try { ServiceSessions()?.CloseSession(sid); } catch { /* ignore */ }
+                _bySession.Remove(sid);
+
+                if (!string.IsNullOrEmpty(rid))
+                {
+                    if (_sessionByRobot.TryGetValue(rid, out var mapSid) && mapSid == sid)
+                        _sessionByRobot.Remove(rid);
+
+                    _dir?.Remove(rid);
+                    if (VerboseLeaves) Debug.Log("[WS] Robot timeout: " + rid);
+                }
+            }
+        }
+    }
+
+    // ===== Public send helpers for UI code =====
+
+    // Send arbitrary JSON text to a robot by id
+    public bool SendJsonToRobot(string robotId, string json)
+    {
+        if (string.IsNullOrEmpty(robotId) || string.IsNullOrEmpty(json)) return false;
+        if (_wss == null) return false;
+
+        if (!_sessionByRobot.TryGetValue(robotId, out var sid)) return false;
+
+        var sessions = ServiceSessions();
+        if (sessions == null) return false;
+
+        try { sessions.SendTo(json, sid); }
+        catch { return false; }
+
+        return true;
+    }
+
+    // Convenience wrappers
+    public bool SendFlashCommand(string robotId, int pin, int ms)
+    {
+        string json = "{\"cmd\":\"flash\",\"pin\":" + pin + ",\"ms\":" + ms + "}";
+        return SendJsonToRobot(robotId, json);
+    }
+
+    public bool SendStreamOff(string robotId)
+    {
+        return SendJsonToRobot(robotId, "{\"cmd\":\"stream_off\"}");
+    }
+
+    public bool SendStreamOn(string robotId)                    // Tell a robot to start its camera
+    {
+        return SendJsonToRobot(robotId, "{\"cmd\":\"stream_on\"}"); // Use same generic sender
+    }
+
+    public bool SendMotorsOn(string robotId)
+    {
+        bool ok = SendJsonToRobot(robotId, "{\"cmd\":\"motors_on\"}");
+        Debug.Log(ok ? $"[WS->Robot] motors_on ? {robotId}" : $"[WS->Robot] FAILED motors_on ? {robotId}");
+        return ok;
+    }
+    public bool SendMotorsOff(string robotId)
+    {
+        bool ok = SendJsonToRobot(robotId, "{\"cmd\":\"motors_off\"}");
+        Debug.Log(ok ? $"[WS->Robot] motors_off ? {robotId}" : $"[WS->Robot] FAILED motors_off ? {robotId}");
+        return ok;
+    }
+
+    public bool SendDrive(string robotId, float left, float right)
+    {
+        // Ensure decimals use '.' regardless of OS locale
+        string l = left.ToString("F3", CultureInfo.InvariantCulture);
+        string r = right.ToString("F3", CultureInfo.InvariantCulture);
+        string json = $"{{\"cmd\":\"drive\",\"l\":{l},\"r\":{r}}}";
+        Debug.Log($"[WS->Robot] drive l={l} r={r} ? {robotId}");
+        return SendJsonToRobot(robotId, json);
+    }
+
+    public bool SendTurret(string robotId, float speed)
+    {
+        string s = speed.ToString("F3", CultureInfo.InvariantCulture);
+        string json = $"{{\"cmd\":\"turret\",\"speed\":{s}}}";
+        Debug.Log($"[WS->Robot] turret {s} ? {robotId}");
+        return SendJsonToRobot(robotId, json);
+    }
+
+    // ===== Internals =====
+
+    private WebSocketServer Host() => _wss;
+
+    // Sessions live on the specific service (path), not on the server root
+    private WebSocketSharp.Server.WebSocketSessionManager ServiceSessions()
+    {
+        if (_wss == null) return null;
+        var svcHost = _wss.WebSocketServices[Path];
+        return svcHost?.Sessions;
+    }
+
+    // Super-tiny string extractor for flat JSON: {"key":"value",...}
+    private static string ExtractString(string s, string key)
+    {
+        if (string.IsNullOrEmpty(s) || string.IsNullOrEmpty(key)) return null;
+        try
+        {
+            int k = s.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
+            if (k < 0) return null;
+            int colon = s.IndexOf(':', k);
+            if (colon < 0) return null;
+            int q1 = s.IndexOf('"', colon + 1);
+            if (q1 < 0) return null;
+            int q2 = s.IndexOf('"', q1 + 1);
+            if (q2 < 0) return null;
+            return s.Substring(q1 + 1, q2 - (q1 + 1));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
+using System;                               // For Action, Exception
+using System.Collections.Generic;           // For Queue<T>
+using System.Net;                           // For IPAddress, IPEndPoint, Dns
+using System.Net.Sockets;                   // For UdpClient, SocketException
+using System.Text;                          // For Encoding.UTF8
+using System.Threading;                     // For Thread
+using UnityEngine;                          // For MonoBehaviour, Debug
+
+// Very small UDP discovery listener.
+// - While in Lobby, wait for robot announces on a UDP port.
+// - When we see {"robotId":"...","callsign":"..."}, we:
+//     1) Update the RobotDirectory (on main thread).
+//     2) Reply to THAT sender with {"ws":"ws://<our-ip>:<wsPort><wsPath>"}.
+//
+// Notes:
+// - A background thread blocks on UDP.Receive (fast + simple).
+// - That thread NEVER touches UnityEngine APIs.
+// - We push any Unity work onto a tiny main-thread queue.
+public class UdpDiscoveryListener : MonoBehaviour
+{
+    [Header("Ports and paths")]
+    [SerializeField] private int discoveryPort = 30560;       // Where robots broadcast their "announce"
+    [SerializeField] private int websocketPort = 8080;        // Your WebSocket server port
+    [SerializeField] private string websocketPath = "/esp32"; // Your WebSocket service path (must match server)
+
+    private IRobotDirectory _dir;    // Shared robot registry (set in AppBootstrap)
+    private GameFlow _flow;          // Game state (we only run in Lobby)
+
+    private UdpClient _udp;          // UDP socket
+    private Thread _rxThread;        // Background thread that blocks in Receive
+    private volatile bool _running;  // Flag to keep the thread loop alive
+
+    // -------- Main-thread queue (Unity-safe) --------
+    private readonly object _mtx = new object();              // Lock for the queue
+    private readonly Queue<Action> _main = new Queue<Action>(); // Actions to run on Unity's main thread
+
+    public void StartUDPServer()                           // Called when this component is enabled
+    {
+        _dir = ServiceLocator.RobotDirectory;               // Get robot directory from your service locator
+        _flow = ServiceLocator.GameFlow;                     // Get game flow to know current phase
+
+        if (_dir == null || _flow == null)                   // If something is missing…
+        {
+            Debug.LogError("[UDP] RobotDirectory or GameFlow is null. Check AppBootstrap.");
+            return;                                          // …we cannot proceed
+        }
+
+        _flow.OnPhaseChanged += HandlePhaseChanged;           // Listen for phase changes (Lobby <-> not Lobby)
+
+        if (_flow.Phase == GamePhase.Lobby)                   // If we are already in Lobby…
+        {
+            StartListener();                                  // …start listening now
+        }
+    }
+
+    private void OnDisable()                                  // Called when this component is disabled
+    {
+        if (_flow != null)                                    // If we previously subscribed…
+        {
+            _flow.OnPhaseChanged -= HandlePhaseChanged;       // …unsubscribe to avoid leaks
+        }
+
+        StopListener();                                       // Make sure the socket/thread are stopped
+    }
+
+    private void Update()                                     // Runs every frame on the main thread
+    {
+        // Drain the queued actions that need Unity main thread (UI, directory events, Debug.Log)
+        Action a = null;                                      // Temporary variable
+        while (true)                                          // Keep going until the queue is empty
+        {
+            lock (_mtx)                                       // Lock the queue while we inspect it
+            {
+                if (_main.Count == 0) break;                  // Nothing left to run
+                a = _main.Dequeue();                          // Take one action out
+            }
+            try { if (a != null) a(); }                       // Execute the action
+            catch (Exception ex) { Debug.LogException(ex); }  // If it throws, log the error
+        }
+    }
+
+    private void HandlePhaseChanged(GamePhase phase)          // Called when GameFlow changes phase
+    {
+        if (phase == GamePhase.Lobby)                         // If we entered Lobby…
+        {
+            StartListener();                                  // …start UDP discovery
+        }
+        else                                                  // If we left Lobby…
+        {
+            StopListener();                                   // …stop UDP discovery
+        }
+    }
+
+    private void StartListener()                              // Open UDP port and start background thread
+    {
+        if (_running) return;                                 // If already running, do nothing
+
+        try
+        {
+            // Bind UDP socket on all interfaces for the given port.
+            _udp = new UdpClient(new IPEndPoint(IPAddress.Any, discoveryPort)); // Listen on 0.0.0.0:discoveryPort
+            _udp.EnableBroadcast = true;                      // Allow receiving broadcast packets
+
+            _running = true;                                  // Set the loop flag to true
+
+            _rxThread = new Thread(ReceiveLoop);              // Create the background thread
+            _rxThread.IsBackground = true;                    // Mark as background so it won't block app exit
+            _rxThread.Start();                                // Start the thread
+
+            Debug.Log("[UDP] Discovery listener started on 0.0.0.0:" + discoveryPort); // Log start
+        }
+        catch (Exception ex)                                   // If something fails during startup…
+        {
+            Debug.LogError("[UDP] Start failed: " + ex.Message); // Log the reason
+            StopListener();                                     // Clean up partially created resources
+        }
+    }
+
+    private void StopListener()                               // Stop the background thread and close the socket
+    {
+        if (!_running) return;                                // If not running, nothing to do
+
+        _running = false;                                     // Tell the thread to exit
+
+        try
+        {
+            if (_udp != null)                                 // If we have a socket…
+            {
+                _udp.Close();                                 // …close it (this unblocks Receive)
+                _udp = null;                                  // …and drop the reference
+            }
+        }
+        catch { /* ignore */ }                                // Ignore any errors closing the socket
+
+        try
+        {
+            if (_rxThread != null)                            // If the thread exists…
+            {
+                _rxThread.Join(200);                          // …wait briefly for it to exit
+                _rxThread = null;                             // …and drop the reference
+            }
+        }
+        catch { /* ignore */ }                                // Ignore join errors
+
+        Debug.Log("[UDP] Discovery listener stopped");        // Log stop
+    }
+
+    private void ReceiveLoop()                                // Runs on the background thread
+    {
+        // IMPORTANT: This method must NOT call UnityEngine APIs (like Debug.Log, GetComponent, etc.)
+        // We only do pure .NET networking here and queue any Unity work to the main thread.
+
+        IPEndPoint remote = new IPEndPoint(IPAddress.Any, 0); // This will hold the sender's IP/port
+
+        while (_running)                                      // Loop until StopListener flips the flag
+        {
+            try
+            {
+                // Block here until a packet arrives or the socket is closed.
+                byte[] data = _udp.Receive(ref remote);       // Receive bytes from whoever sent us a packet
+
+                // Convert bytes to string (robots send small JSON like {"robotId":"...","callsign":""})
+                string text = Encoding.UTF8.GetString(data);  // Interpret bytes as UTF-8 text
+
+                // Pull out robotId (and callsign if present) using a tiny string extractor
+                string robotId = ExtractJsonString(text, "robotId");   // Get the robot id
+                string callsign = ExtractJsonString(text, "callsign");  // Get the callsign (can be empty)
+
+                if (!string.IsNullOrEmpty(robotId))           // Only act if we actually got an id
+                {
+                    string senderIp = remote.Address.ToString(); // The IP address the packet came from
+
+                    // 1) Update the registry on the main thread so UI stays happy.
+                    PostMain(() =>
+                    {
+                        _dir.Upsert(robotId, callsign, senderIp); // Add/update robot in the directory
+                    });
+
+                    // 2) Reply to THIS sender with our WebSocket URL.
+                    //    Use the UDP socket's *local* address to avoid sending a wrong NIC/VPN IP.
+                    string ip = PetersUtils.GetLocalIPAddress().ToString(); // or your own util to pick an IPv4 on the active NIC
+                    string wsUrl = "ws://" + ip + ":" + websocketPort + websocketPath;
+                    string reply = "{\"ws\":\"" + wsUrl + "\"}"; // Minimal JSON reply the robot expects
+                    byte[] outBytes = Encoding.UTF8.GetBytes(reply); // Turn reply into bytes
+
+                    _udp.Send(outBytes, outBytes.Length, remote);   // Send reply back to the sender (unicast)
+                    Debug.Log("[UDP] Replied to " + robotId + " at " + senderIp + " with " + wsUrl); // Log the reply
+                }
+            }
+            catch (SocketException)                          // Thrown when socket is closed while blocked in Receive
+            {
+                if (_running)                                // If we didn't intend to stop…
+                {
+                    // Do nothing here (no Unity logs from this thread).
+                    // Next loop iteration will continue (or exit if StopListener was called).
+                }
+            }
+            catch (Exception)                                // Any other error while receiving/parsing
+            {
+                // Keep the loop alive for robustness, but do not call Unity from here.
+            }
+        }
+    }
+
+    private void PostMain(Action a)                          // Queue an action to the main thread
+    {
+        if (a == null) return;                               // Ignore null actions
+        lock (_mtx) { _main.Enqueue(a); }                    // Put the action in the queue under a lock
+    }
+
+    private static string ExtractJsonString(string s, string key) // Tiny helper to parse {"key":"value"} from a short JSON
+    {
+        try                                                  // Keep it safe (no throw)
+        {
+            string needle = "\"" + key + "\"";               // Build the '"key"' token to search for
+            int k = s.IndexOf(needle, StringComparison.Ordinal); // Find the key in the text
+            if (k < 0) return null;                          // If not found, return null
+            int colon = s.IndexOf(':', k);                   // Find the ':' after the key
+            if (colon < 0) return null;                      // If no colon, give up
+            int q1 = s.IndexOf('"', colon + 1);              // Find first quote after the colon
+            int q2 = s.IndexOf('"', q1 + 1);                 // Find closing quote
+            if (q1 < 0 || q2 < 0) return null;               // If quotes missing, give up
+            return s.Substring(q1 + 1, q2 - (q1 + 1));       // Return the text between quotes
+        }
+        catch { return null; }                               // On any error, just return null
+    }
+}

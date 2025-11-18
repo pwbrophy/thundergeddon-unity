@@ -1,97 +1,72 @@
-// GamePanelPresenter.cs � shows the in-game robot list and switches the active camera on click
-using System;                                   // For basic types
-using System.Collections.Generic;               // For List<>
-using TMPro;                                    // For TextMeshProUGUI
-using UnityEngine;                              // For MonoBehaviour, GameObject, Debug
-using UnityEngine.UI;                           // For Button
+﻿using System.Collections.Generic;                 // For List<T>
+using TMPro;                                      // For TextMeshProUGUI
+using UnityEngine;                                // For MonoBehaviour, Debug
+using UnityEngine.UI;                             // For Button
 
-public class GamePanelPresenter : MonoBehaviour // Attach this to your Playing panel root
+/// <summary>
+/// GamePanelPresenter
+/// - Wires the Playing screen to TurnManager.
+/// - Shows "Alliance N • PlayerName".
+/// - Filters RobotSelectionPanel to only the current player's robots.
+/// - End Turn steps player→player→next alliance.
+/// </summary>
+public class GamePanelPresenter : MonoBehaviour
 {
-    [Header("UI wiring")]                        // Inspector header
-    [SerializeField] private RectTransform content;  // Parent under a VerticalLayoutGroup
-    [SerializeField] private GameObject rowPrefab;   // Prefab with "Name"(TMP) + "FlashButton"(Button)
+    [Header("UI")]                                                   // Inspector wiring
+    [SerializeField] private TextMeshProUGUI turnLabel;              // "Alliance N • PlayerName"
+    [SerializeField] private Button endTurnButton;                   // Ends current player's turn
+    [SerializeField] private RobotSelectionPanel selectionPanel;     // Filters by allowed robots
 
-    [Header("Video")]
-    [SerializeField] private ESP32VideoReceiver video; // Drag the ESP32VideoReceiver in here (or leave null and it will find Instance)
+    // References to shared services.
+    private IRobotDirectory _dir;                                    // Robot directory
+    private TurnManager _turns;                                      // Turn controller
 
-    private GameService _game;                   // Reference to GameService for state
-    private RobotWebSocketServer _ws;            // Reference to WS server to send commands
-    private string _activeRobotId;               // Tracks which robot is currently �on camera�
-
-    private void OnEnable()                      // Called when panel becomes active
+    private void OnEnable()
     {
-        _game = ServiceLocator.Game;             // Get the game service
-        _ws = ServiceLocator.RobotServer;      // Get the running WS server (set at start)
+        // Resolve services.
+        _dir = ServiceLocator.RobotDirectory;                        // Directory
+        if (_dir == null) { Debug.LogError("[GamePanel] RobotDirectory missing"); return; } // Safety
 
-        if (video == null) video = ESP32VideoReceiver.Instance; // Fill from singleton if not wired
+        // Create the turn manager.
+        _turns = new TurnManager();                                  // New manager
 
-        if (_game == null || _game.State == null) // If no game is running yet
-        {
-            Debug.LogWarning("[GamePanel] No game state yet."); // Warn for awareness
-            return;                               // Nothing to render
-        }
+        // IMPORTANT: Subscribe BEFORE Initialize(), so we catch the initial PublishTurn().
+        _turns.TurnChanged += OnTurnChanged;                         // Listen first
 
-        if (content == null || rowPrefab == null) // Ensure UI is wired
-        {
-            Debug.LogError("[GamePanel] Missing content or rowPrefab."); // Log error
-            return;                               // Bail out
-        }
+        // Now initialize (this will call PublishTurn() and we will receive it).
+        _turns.Initialize(_dir);                                     // Wire + build + publish
 
-        Rebuild();                                // Build the list for the current state
+        // Wire the end-turn button to advance the turn.
+        if (endTurnButton) endTurnButton.onClick.AddListener(OnEndTurnClicked); // Hook
     }
 
-    private void OnDisable()                      // Called when panel is hidden
+    private void OnDisable()
     {
-        Clear();                                  // Clean up child rows
+        // Unwire events to avoid leaks.
+        if (_turns != null) _turns.TurnChanged -= OnTurnChanged;     // Unhook
+        if (endTurnButton) endTurnButton.onClick.RemoveListener(OnEndTurnClicked); // Unhook
     }
 
-    private void Rebuild()                        // Build rows from GameService.State.Robots
+    // Update UI when the current turn changes.
+    private void OnTurnChanged(int allianceIndex, int playerIndexInAlliance, List<string> allowedIds)
     {
-        Clear();                                  // Start fresh
+        // Compute a friendly label: "Alliance N • PlayerName" (or "—" if no players in that alliance).
+        string playerName = _turns.CurrentPlayerName ?? "—";         // Name or dash
+        if (turnLabel) turnLabel.text = $"Alliance {allianceIndex + 1} • {playerName}"; // Label
 
-        List<RobotInfo> robots = _game.State.Robots; // Get the snapshot list
-        for (int i = 0; i < robots.Count; i++)       // Loop through each robot
-        {
-            var r = robots[i];                       // Current robot
-            var row = Instantiate(rowPrefab, content, false); // Make a new row under the content
-            row.name = r.RobotId;                    // Name the row with the robot id
+        // Apply the allowed filter to the selection panel.
+        if (selectionPanel) selectionPanel.SetAllowedFilter(allowedIds); // Filter list
 
-            var nameText = row.transform.Find("Name").GetComponent<TextMeshProUGUI>(); // Find label
-            var button = row.transform.Find("FlashButton").GetComponent<Button>();    // Find button
-
-            nameText.text = string.IsNullOrEmpty(r.Callsign) ? r.RobotId : r.Callsign;  // Show name/id
-
-            button.onClick.RemoveAllListeners();     // Clear previous listeners (safety)
-            button.onClick.AddListener(() =>         // Add a click handler
-            {
-                if (_ws == null)                     // Ensure WS server is available
-                {
-                    Debug.LogWarning("[GamePanel] WS server not ready."); // Warn if missing
-                    return;                          // Do nothing
-                }
-
-                // 1) If we were viewing another robot, tell it to stop streaming
-                if (!string.IsNullOrEmpty(_activeRobotId) && _activeRobotId != r.RobotId) // Switching sources?
-                {
-                    _ws.SendStreamOff(_activeRobotId);            // Stop the previous camera (best effort)
-                }
-
-                // 2) Switch the UI receiver to this robot
-                _activeRobotId = r.RobotId;                       // Remember active robot id
-                if (video != null) video.SetActiveRobot(_activeRobotId); // Tell the receiver which frames to show
-
-                // 3) Send the flash command (your ESP32 treats this as �flash + start stream�)
-                bool ok = _ws.SendFlashCommand(r.RobotId, 48, 2000); // Pin 48, 2 seconds
-                if (!ok) Debug.LogWarning("[GamePanel] Send failed (robot offline?)");   // Warn if send failed
-            });
-        }
+        // Ensure the current selection is valid for this turn.
+        // - If selected robot is NOT in allowed list, we auto-deselect (and stop cam/motors).
+        // - Then we auto-select the first allowed robot (if any) to keep things snappy.
+        if (selectionPanel) selectionPanel.EnsureValidSelectionAfterFilter(autoSelectFirstAllowed: true); // Fix selection
     }
 
-    private void Clear()                           // Destroy all generated rows under 'content'
+    // Button: advance to next player (and alliance when appropriate).
+    private void OnEndTurnClicked()
     {
-        for (int i = content.childCount - 1; i >= 0; i--) // Loop backwards for safety
-        {
-            Destroy(content.GetChild(i).gameObject);      // Destroy each row GameObject
-        }
+        // Ask TurnManager to step the turn (player→player→next alliance).
+        _turns?.EndTurn();                                           // Advance
     }
 }

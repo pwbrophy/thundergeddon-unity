@@ -37,11 +37,23 @@ public class AppBootstrap : MonoBehaviour
         Debug.Log($"[AppBootstrap] RobotDirectory created: {ServiceLocator.RobotDirectory.GetHashCode()}"); // Log instance id
 
         // Create ONE shared PlayersService and seed it with defaults.
-        var players = new PlayersService();          // Create a new players service
-        players.LoadOrEnsureDefaults();              // New: load from disk OR create Player1/2
-        ServiceLocator.Players = players;            // Register globally so UI / TurnManager share it
+        var players = new PlayersService();                                     // Allocate players service
+        players.EnsureDefaults();                                               // Make sure Player1 / Player2 exist
+        ServiceLocator.Players = players;                                       // Expose via ServiceLocator
         Debug.Log($"[AppBootstrap] PlayersService created: {players.GetHashCode()} with {players.GetAll().Count} players"); // Log
 
 
     }
+}
+
+
+public static class ServiceLocator
+{
+    public static IRobotDirectory RobotDirectory; 
+    public static GameFlow GameFlow;
+    public static LobbyService Lobby;
+    public static GameService Game;
+    public static RobotWebSocketServer RobotServer;  // Set by RobotWebSocketServer when it starts
+    public static PlayersService Players;
+
 }

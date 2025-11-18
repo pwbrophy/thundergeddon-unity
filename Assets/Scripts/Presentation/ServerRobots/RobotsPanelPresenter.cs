@@ -180,26 +180,35 @@ public class RobotsPanelPresenter : MonoBehaviour
         ipText.text = string.IsNullOrEmpty(r.Ip) ? "IP: ?" : $"IP: {r.Ip}";
         playerText.text = string.IsNullOrEmpty(r.AssignedPlayer) ? "Unassigned" : r.AssignedPlayer;
 
-        editButton.onClick.RemoveAllListeners();
+        // (After setting nameText/ipText/playerText)
+        editButton.onClick.RemoveAllListeners();                               // Clear old listeners
         editButton.onClick.AddListener(() =>
         {
-            if (renamePopup == null)
+            // If the popup reference is missing, bail out gracefully.
+            if (renamePopup == null)                                           // Popup not wired in inspector?
             {
-                Debug.Log("[RobotsPanelPresenter] RenamePopup is not assigned. Skipping edit.");
-                return;
+                Debug.Log("[RobotsPanelPresenter] RenamePopup is not assigned. Skipping edit."); // Helpful log
+                return;                                                        // Do nothing
             }
 
+            // Open the popup using the NEW 3-argument callback: (id, newName, playerOrNull).
             renamePopup.Open(
-                r.RobotId,
-                r.Callsign,
-                string.IsNullOrEmpty(r.AssignedPlayer) ? "Unassigned" : r.AssignedPlayer,
-                (newName, newPlayer) =>
+                r.RobotId,                                                     // Robot id we are editing
+                r.Callsign,                                                    // Current display name
+                                                                               // Pass through the currently assigned player name (null = unassigned).
+                                                                               // ALSO treat the legacy literal "Unassigned" as unassigned for safety with older data.
+                (string.IsNullOrWhiteSpace(r.AssignedPlayer) || r.AssignedPlayer == "Unassigned")
+                    ? null                                                     // Treat blank / "Unassigned" as no player
+                    : r.AssignedPlayer,                                        // Otherwise use the stored player name
+                (id, newName, newPlayer) =>
                 {
-                    _dir.SetCallsign(r.RobotId, newName);
-                    _dir.SetAssignedPlayer(r.RobotId, newPlayer);
+                    // Apply the edited name and player assignment back into the directory.
+                    _dir.SetCallsign(id, newName);                             // Update callsign in RobotDirectory
+                    _dir.SetAssignedPlayer(id, newPlayer);                     // Update or clear player assignment
                 }
             );
         });
+
     }
 
 }

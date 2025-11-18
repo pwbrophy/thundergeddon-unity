@@ -33,54 +33,65 @@ public class RobotDirectory : IRobotDirectory
         return _byId.TryGetValue(robotId, out info);
     }
 
-    // Treat this as "insert or update". We ignore online/offline entirely.
     public void Upsert(string robotId, string callsign, string ip)
     {
-        if (string.IsNullOrWhiteSpace(robotId)) return;
+        // Ignore bad robot ids.
+        if (string.IsNullOrWhiteSpace(robotId)) return;                    // If id is blank, do nothing
 
-        if (!_byId.TryGetValue(robotId, out var r))
+        // Try to get an existing robot entry.
+        if (!_byId.TryGetValue(robotId, out var r))                        // If we do NOT already know this id
         {
-            // New robot → add to dictionary and to the insertion order list
-            r = new RobotInfo
+            // Create a brand new RobotInfo for this robot.
+            r = new RobotInfo                                              // Allocate a new RobotInfo
             {
-                RobotId = robotId,
-                Callsign = string.IsNullOrWhiteSpace(callsign) ? GenerateGenericName() : callsign.Trim(),
-                Ip = ip ?? "",
-                AssignedPlayer = "Unassigned",
-                // You can delete IsOnline from RobotInfo if you want; we just won't set it here.
+                RobotId = robotId,                                         // Store the unique robot id
+                Callsign = string.IsNullOrWhiteSpace(callsign)             // If no callsign was supplied
+                    ? GenerateGenericName()                                //   -> auto-generate a name like "robot-01"
+                    : callsign.Trim(),                                     //   -> otherwise use the trimmed callsign
+                Ip = string.IsNullOrWhiteSpace(ip) ? "" : ip.Trim(),       // Store IP if we got one, else empty
+                AssignedPlayer = null,                                     // Null means "unassigned" in our code
             };
 
-            _byId.Add(robotId, r);
-            _order.Add(robotId);                // track insertion order
-            OnRobotAdded?.Invoke(r);
+            _byId.Add(robotId, r);                                         // Add to dictionary for fast lookup
+            _order.Add(robotId);                                           // Track insertion order
+            OnRobotAdded?.Invoke(r);                                       // Notify listeners that a robot was added
         }
-        else
+        else                                                               // We already have this robot
         {
-            // Existing robot → update fields if changed
-            bool changed = false;
+            bool changed = false;                                          // Track if anything actually changes
 
-            if (!string.IsNullOrWhiteSpace(callsign))
+            // Update callsign only if we were given a non-empty value.
+            if (!string.IsNullOrWhiteSpace(callsign))                      // If caller provided a callsign
             {
-                string newName = callsign.Trim();
-                if (r.Callsign != newName)
+                string newName = callsign.Trim();                          //   -> trim the new name
+                if (r.Callsign != newName)                                 //   -> only update if different
                 {
-                    r.Callsign = newName;
-                    changed = true;
+                    r.Callsign = newName;                                  //   -> store the new name
+                    changed = true;                                        //   -> remember that something changed
                 }
             }
 
-            if (!string.IsNullOrWhiteSpace(ip) && r.Ip != ip)
+            // IMPORTANT: only update IP when the caller gives a non-empty IP.
+            // This means the WS "hello" call with ip="" will NOT wipe the IP
+            // that was already learned from UDP discovery.
+            if (!string.IsNullOrWhiteSpace(ip))                            // If caller supplied a non-empty IP
             {
-                r.Ip = ip;
-                changed = true;
+                string newIp = ip.Trim();                                  //   -> trim the IP string
+                if (r.Ip != newIp)                                         //   -> only update if it actually changed
+                {
+                    r.Ip = newIp;                                          //   -> store the new IP
+                    changed = true;                                        //   -> mark that we changed something
+                }
             }
 
-            if (changed)
+            // Only raise the update event if we actually changed something.
+            if (changed)                                                   // If any field was updated
             {
-                OnRobotUpdated?.Invoke(r);
+                OnRobotUpdated?.Invoke(r);                                 //   -> notify listeners about the update
             }
         }
     }
+
 
     public void SetCallsign(string robotId, string newCallsign)
     {
@@ -96,16 +107,22 @@ public class RobotDirectory : IRobotDirectory
         }
     }
 
+    // New logic: setting an empty / null player name now *clears* the assignment.
     public void SetAssignedPlayer(string robotId, string playerName)
     {
-        if (string.IsNullOrWhiteSpace(playerName)) return;
-        if (_byId.TryGetValue(robotId, out var r))
+        // First make sure the robot exists; if not, quietly do nothing.
+        if (!_byId.TryGetValue(robotId, out var r)) return;                  // Unknown id -> ignore
+
+        // Normalise the input: null / empty / whitespace all become "no assignment".
+        string normalized = string.IsNullOrWhiteSpace(playerName)            // Is the name blank?
+            ? null                                                           //   -> store null for "unassigned"
+            : playerName.Trim();                                             //   -> otherwise store trimmed name
+
+        // Only update the record if the value really changed.
+        if (r.AssignedPlayer != normalized)                                  // Different from existing?
         {
-            if (r.AssignedPlayer != playerName)
-            {
-                r.AssignedPlayer = playerName;
-                OnRobotUpdated?.Invoke(r);
-            }
+            r.AssignedPlayer = normalized;                                   // Store new (or cleared) assignment
+            OnRobotUpdated?.Invoke(r);                                       // Notify listeners (UI, TurnManager)
         }
     }
 

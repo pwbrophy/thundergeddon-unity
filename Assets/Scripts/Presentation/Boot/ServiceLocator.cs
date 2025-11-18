@@ -7,5 +7,6 @@ public static class ServiceLocator
     public static LobbyService Lobby;
     public static GameService Game;
     public static RobotWebSocketServer RobotServer;  // Set by RobotWebSocketServer when it starts
+    public static PlayersService Players;
 
 }
